@@ -1,0 +1,103 @@
+diff --git a/devices/Cargo.toml b/devices/Cargo.toml
+index 5dbc402..e12c5a2 100644
+--- a/devices/Cargo.toml
++++ b/devices/Cargo.toml
+@@ -83,7 +83,7 @@ once_cell = "1.7.2"
+ power_monitor = { path = "../power_monitor" }
+ protobuf = { version = "3.2", optional = true }
+ protos = { path = "../protos", optional = true }
+-rand = "0.8"
++rand = "0.9"
+ remain = "0.2"
+ resources = { path = "../resources" }
+ serde = { version = "1", features = [ "derive", "rc" ] }
+@@ -100,7 +100,7 @@ cros_tracing = { path = "../cros_tracing" }
+ swap = { path = "../swap" }
+ vmm_vhost = { path = "../third_party/vmm_vhost" }
+ virtio_sys = { path = "../virtio_sys" }
+-virtio-media = { version = "0.0.7", optional = true }
++virtio-media = { path = "../../virtio-media/device", optional = true }
+ vm_control = { path = "../vm_control" }
+ vm_memory = { path = "../vm_memory" }
+ zerocopy = { version = "0.8.13", features = ["derive"] }
+diff --git a/devices/src/virtio/media.rs b/devices/src/virtio/media.rs
+index a6a1dff..f41357d 100644
+--- a/devices/src/virtio/media.rs
++++ b/devices/src/virtio/media.rs
+@@ -1040,6 +1040,7 @@ pub fn create_virtio_media_loopback_device(
+ pub fn create_virtio_media_v4l2_proxy_device<P: AsRef<Path>>(
+     features: u64,
+     device_path: P,
++    pool: Option<MediaPool>,
+ ) -> anyhow::Result<Box<dyn VirtioDevice>> {
+     use virtio_media::devices::V4l2ProxyDevice;
+     use virtio_media::v4l2r;
+@@ -1068,7 +1069,9 @@ pub fn create_virtio_media_v4l2_proxy_device<P: AsRef<Path>>(
+     let device = CrosvmVirtioMediaDevice::new(
+         features,
+         config,
+-        None,
++        // DroidVM: with the VM's media_host pool there is no BAR to declare (it does not fit on
++        // Gunyah); the guest's USERPTR buffers are shadowed by host MMAP ones in the proxy.
++        pool,
+         // The proxied buffers belong to the host V4L2 device, so the proxy has no allocator of
+         // its own to be handed.
+         move |event_queue, guest_mapper, mapper, _allocator| {
+diff --git a/src/crosvm/sys/linux.rs b/src/crosvm/sys/linux.rs
+index 69e8376..7222916 100644
+--- a/src/crosvm/sys/linux.rs
++++ b/src/crosvm/sys/linux.rs
+@@ -1164,14 +1164,6 @@ fn create_virtio_devices(
+         }
+     }
+ 
+-    #[cfg(any(target_os = "android", target_os = "linux"))]
+-    #[cfg(feature = "media")]
+-    {
+-        for v4l2_device in &cfg.v4l2_proxy {
+-            devs.push(create_v4l2_device(cfg.protection_type, v4l2_device)?);
+-        }
+-    }
+-
+     #[cfg(feature = "media")]
+     {
+         // `--simple-media-device` is the old spelling of `--virtio-media kind=simple`, so it adds
+@@ -1208,7 +1200,7 @@ fn create_virtio_devices(
+         // by carving static per-helper slices; M8 replaced the slices with this, so a 4K
+         // decode's ~190 MiB CAPTURE set can have the pool while the other devices are idle
+         // instead of hitting its 128 MiB slice.)
+-        let handle = if media_devices.is_empty() {
++        let handle = if media_devices.is_empty() && cfg.v4l2_proxy.is_empty() {
+             None
+         } else {
+             match MediaPoolHandle::from_guest_memory(vm.get_memory()) {
+@@ -1229,6 +1221,11 @@ fn create_virtio_devices(
+             Some(handle) => Some(MediaPool::new(handle)?),
+         };
+ 
++        // `--v4l2-proxy`: host V4L2 devices (here the Iris decoder) with the VM's pool, so no BAR.
++        for v4l2_device in &cfg.v4l2_proxy {
++            devs.push(create_v4l2_device(cfg.protection_type, v4l2_device, pool.clone())?);
++        }
++
+         for media_cfg in media_devices {
+             devs.push(create_virtio_media_device(
+                 cfg.protection_type,
+diff --git a/src/crosvm/sys/linux/device_helpers.rs b/src/crosvm/sys/linux/device_helpers.rs
+index f657797..c4af4c9 100644
+--- a/src/crosvm/sys/linux/device_helpers.rs
++++ b/src/crosvm/sys/linux/device_helpers.rs
+@@ -1733,11 +1733,12 @@ fn media_helper_end(pid: Pid) -> Option<String> {
+ pub fn create_v4l2_device<P: AsRef<Path>>(
+     protection_type: ProtectionType,
+     path: P,
++    pool: Option<devices::virtio::media::MediaPool>,
+ ) -> DeviceResult {
+     use devices::virtio::media::create_virtio_media_v4l2_proxy_device;
+ 
+     let features = virtio::base_features(protection_type);
+-    let dev = create_virtio_media_v4l2_proxy_device(features, path)?;
++    let dev = create_virtio_media_v4l2_proxy_device(features, path, pool)?;
+ 
+     Ok(VirtioDeviceStub { dev, jail: None })
+ }

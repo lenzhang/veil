@@ -1,0 +1,39 @@
+From a7e76ffcb80c34acc2c689e46fa8ff8946ffe5c4 Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Tue, 10 Nov 2026 03:16:42 +0800
+Subject: [PATCH] k27: VM guest: 12 GiB of zone VA instead of 24 (guest RAM
+ past 8 GiB)
+
+The kernel map shares its VA window with the physical aperture, which grows with the guest's RAM.
+With 24 GiB reserved for zones the pointer ranges were ~640 MiB each at 8 GiB of RAM and negative at
+10 GiB (kmem_add_extra_claims: free_size - claims underflowed, the kernel stopped in startup). The zone
+map is at most 8 GiB (~3/8 of RAM below that). 10, 12 and 13 GiB guests boot and log in.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ osfmk/kern/zalloc.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 9edf8c5..c831172 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -170,6 +170,15 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #if   XNU_PLATFORM_MacOSX
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
++#elif XNU_VM_GUEST
++/*
++ * VM guest (4 KiB pages, no ARM_LARGE_MEMORY): the kernel map shares its VA window with the physical
++ * aperture, which grows with the guest's RAM. With 24 GiB reserved for zones the pointer ranges were
++ * ~640 MiB each at 8 GiB of RAM and negative at 10 GiB (kmem_add_extra_claims). The zone map itself
++ * is at most ZONE_MAP_MAX (and ~3/8 of RAM below that), so 12 GiB of VA is plenty.
++ */
++#define ZONE_MAP_MAX            (8ULL << 30)
++#define ZONE_MAP_VA_SIZE        (12ULL << 30)
+ #else
+ #define ZONE_MAP_MAX            (8ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (24ULL << 30)
+-- 
+2.55.0
+

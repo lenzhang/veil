@@ -1,0 +1,13 @@
+--- a/DroidVMVTHost.cpp	2026-11-10 04:58:16
++++ b/DroidVMVTHost.cpp	2026-11-10 04:58:16
+@@ -2923,6 +2923,10 @@
+         break;
+     case cc("+dec"): createDecoder(c, h, m, n); break;
+     case cc("dset"): replyStatus(c, h, 0); break;
++    // dsts: whether the session takes a (new) format description (,fds; VTDecompressionSessionCanAcceptFormatDescription).
++    // Answered -12900 by default, VideoToolbox dropped every HEVC session before its first frame (its sample descriptions
++    // carry colr/chrm/clli extensions and are checked) and decoded in software. The device takes what the stream says.
++    case cc("dsts"): replyStatus(c, h, 0); break;
+     case cc("dmul"): replyStatus(c, h, 0); break;
+     case cc("dsta"): {
+         const int error = s ? startSession(s, m, n) : -12903;

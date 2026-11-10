@@ -1,0 +1,29 @@
+diff --git a/gpu_display/src/display_wl.c b/gpu_display/src/display_wl.c
+index b195c42..e065002 100644
+--- a/gpu_display/src/display_wl.c
++++ b/gpu_display/src/display_wl.c
+@@ -693,6 +693,11 @@ static void surface_enter(void *data, struct wl_surface *wl_surface,
+ 
+ 	surface->scale = (output->device_scale_factor / 1000.0) *
+ 			 (output->current_scale / 1000.0);
++	// DroidVM: CROSVM_WL_SURFACE_SCALE=1 shows the guest's buffer pixel for logical pixel on a scaled output (the
++	// thin host's kiosk: a 1600x1068 guest on the 3200x2136 panel at scale 2 fills it, upscaled by the compositor).
++	const char *forced_scale = getenv("CROSVM_WL_SURFACE_SCALE");
++	if (forced_scale && atof(forced_scale) > 0)
++		surface->scale = atof(forced_scale);
+ 
+ 	if (surface->viewport) {
+ 		wp_viewport_set_destination(
+@@ -1089,6 +1094,12 @@ struct dwl_surface *dwl_context_surface_new(struct dwl_context *self,
+ 			goto fail;
+ 		}
+ 		xdg_toplevel_set_title(disp_surface->xdg_toplevel, "crosvm");
++		// DroidVM: CROSVM_WL_FULLSCREEN=1 asks the compositor to show the screen full screen (GNOME: the VM on the
++		// tablet's panel; cage makes every window full screen anyway). App id for desktop entries and window rules.
++		xdg_toplevel_set_app_id(disp_surface->xdg_toplevel, "droidvm-macos");
++		const char *fullscreen = getenv("CROSVM_WL_FULLSCREEN");
++		if (fullscreen && fullscreen[0] == '1')
++			xdg_toplevel_set_fullscreen(disp_surface->xdg_toplevel, NULL);
+ 		xdg_toplevel_add_listener(disp_surface->xdg_toplevel,
+ 					      &toplevel_listener, disp_surface);
+ 

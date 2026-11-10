@@ -1,0 +1,37 @@
+--- a/DroidVMVTHost.cpp	2026-11-10 02:22:11
++++ b/DroidVMVTHost.cpp	2026-11-10 02:22:11
+@@ -518,11 +518,24 @@
+     IOLockUnlock(gTableLock);
+ }
+ 
++// Whether device `d`'s card names `role` ("decoder", "encoder"), in any case: MediaCodec's cards say "c2.qti.avc.decoder", a
++// Linux host's V4L2 driver its own name ("Iris Decoder" on the SM8750's Iris).
++static bool cardIs(unsigned d, const char *role) {
++    const char *card = droidvm_media_card(d);
++    const size_t n = strlen(role);
++    for (size_t i = 0; card[i] && i < 33; ++i) {
++        size_t j = 0;
++        while (j < n && card[i + j] && (card[i + j] | 0x20) == role[j]) ++j;
++        if (j == n) return true;
++    }
++    return false;
++}
++
+ unsigned decoderDevice() {
+     static unsigned device = ~0u;
+     if (device != ~0u) return device;
+     for (unsigned d = 0; d < droidvm_media_devices(); ++d) {
+-        if (!droidvm_media_is_up(d) || !strnstr(droidvm_media_card(d), "decoder", 33)) continue;
++        if (!droidvm_media_is_up(d) || !cardIs(d, "decoder")) continue;
+         droidvm_media_set_sink(d, mediaSink, reinterpret_cast<void *>(uintptr_t(d)));
+         device = d;
+         break;
+@@ -534,7 +547,7 @@
+     static unsigned device = ~0u;
+     if (device != ~0u) return device;
+     for (unsigned d = 0; d < droidvm_media_devices(); ++d) {
+-        if (!droidvm_media_is_up(d) || !strnstr(droidvm_media_card(d), "encoder", 33)) continue;
++        if (!droidvm_media_is_up(d) || !cardIs(d, "encoder")) continue;
+         droidvm_media_set_sink(d, mediaSink, reinterpret_cast<void *>(uintptr_t(d)));
+         device = d;
+         break;

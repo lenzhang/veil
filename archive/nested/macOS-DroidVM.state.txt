@@ -1,0 +1,33 @@
+# macOS-DroidVM
+remote: https://github.com/Droid-VM/macOS-DroidVM.git
+HEAD: abcbc18f4791b9cd4a3b2a52c92ef8382435376d
+branch: main
+
+## status
+ M configs/kc-keep.txt
+ M k27/segaddrs.json
+ M k27/segaddrs.sh
+ M overlay/kext/DroidVMDisplay/DroidVMDisplay.cpp
+ M overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h
+ M overlay/metal/NativeAdrenoMetalPlugin.mm
+?? boot-disk-piano.sh
+?? build-k27-piano.sh
+?? build-metal-plugin-piano.sh
+?? iterate-k27-piano.sh
+?? k27/build-native-display-piano.sh
+?? k27/kc-build27-piano.py
+?? overlay-piano/
+?? patches/droidvm-audio/0004-ring-whole-periods.patch
+?? patches/droidvm-video/0013-card-role-any-case.patch
+?? patches/droidvm-video/0014-decoder-rating-1000.patch
+?? patches/droidvm-video/0015-dsts-accept-format.patch
+?? patches/droidvm-video/0016-hvcc-skip-sei.patch
+?? patches/droidvm-video/0017-dsts-decline-image-tiles.patch
+?? patches/xnu-12377/0050-vm-guest-tlb.patch
+?? patches/xnu-12377/0051-vm-guest-poweroff-unmount-bootstrap-tables.patch
+?? patches/xnu-12377/0052-vm-guest-zone-va-12g.patch
+?? restart-vm-piano.sh
+?? restart-vm-piano.sh.bak-stop
+?? scripts/piano-frontend-patch.py
+
+## submodule status

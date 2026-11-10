@@ -1,0 +1,648 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index a7b8a8c..656dc7f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -339,6 +339,10 @@ audio_aaudio = ["devices/audio_aaudio"]
+ ## Android audio on a non-Android target
+ libaaudio_stub = ["android_audio/libaaudio_stub"]
+ 
++## The AAudio NDK calls on ALSA (libasound.so.2, opened at run time), for the AAudio virtio-snd
++## backend on a Linux host.
++libaaudio_alsa = ["android_audio/libaaudio_alsa"]
++
+ ## Enables use of the ChromeOS audio server. ChromeOS builds will replace libcras_stub with an
+ ## implementation that talks to the audio server. In upstream builds, using this option will panic.
+ audio_cras = ["devices/audio_cras"]
+diff --git a/android_audio/Cargo.toml b/android_audio/Cargo.toml
+index ebe99ec..ddca0e9 100644
+--- a/android_audio/Cargo.toml
++++ b/android_audio/Cargo.toml
+@@ -6,6 +6,8 @@ edition = "2021"
+ 
+ [features]
+ libaaudio_stub = []
++# the AAudio calls on ALSA (libasound.so.2, dlopen): virtio-snd on a Linux host
++libaaudio_alsa = []
+ 
+ [lib]
+ path = "src/lib.rs"
+diff --git a/android_audio/src/lib.rs b/android_audio/src/lib.rs
+index ddde9c0..e6741ad 100644
+--- a/android_audio/src/lib.rs
++++ b/android_audio/src/lib.rs
+@@ -6,6 +6,8 @@ pub mod device_table;
+ 
+ #[cfg(feature = "libaaudio_stub")]
+ mod libaaudio_stub;
++#[cfg(feature = "libaaudio_alsa")]
++mod libaaudio_alsa;
+ 
+ use std::os::raw::c_void;
+ use std::path::PathBuf;
+diff --git a/android_audio/src/libaaudio_alsa.rs b/android_audio/src/libaaudio_alsa.rs
+new file mode 100644
+index 0000000..5944697
+--- /dev/null
++++ b/android_audio/src/libaaudio_alsa.rs
+@@ -0,0 +1,513 @@
++// Copyright 2026 The ChromiumOS Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++//! The AAudio NDK calls the aaudio backend makes, on ALSA: virtio-snd for a Linux host (the piano
++//! tablet's Ubuntu, where crosvm runs on Gunyah without Android underneath).
++//!
++//! The backend (lib.rs) paces itself and only needs reads and writes that wait up to a timeout, so
++//! this is a thin layer: one ALSA PCM per stream, opened non-blocking and waited on with
++//! snd_pcm_wait. libasound.so.2 is opened with the first stream (dlopen), so crosvm has no link-time
++//! dependency on it; without it every open fails, which the backend takes as an absent endpoint
++//! (silence, asked again every half second).
++//!
++//! The PCM is DROIDVM_ALSA_PLAYBACK / DROIDVM_ALSA_CAPTURE, else DROIDVM_ALSA_DEVICE, else "default"
++//! -- PipeWire on a desktop, where a VMM running as root needs PIPEWIRE_RUNTIME_DIR=/run/user/<uid>
++//! to reach the session's daemon. A stream asked for nothing (the backend's probe of what an
++//! endpoint runs at) opens no PCM and answers 48 kHz, stereo, 16-bit: what PipeWire runs at.
++
++use std::ffi::CString;
++use std::os::raw::c_char;
++use std::os::raw::c_int;
++use std::os::raw::c_long;
++use std::os::raw::c_uint;
++use std::os::raw::c_ulong;
++use std::os::raw::c_void;
++use std::sync::OnceLock;
++use std::time::Duration;
++use std::time::Instant;
++
++use base::error;
++use base::warn;
++
++use crate::AAudioStream;
++use crate::AAudioStreamBuilder;
++use crate::AaudioFormatT;
++use crate::AaudioResultT;
++
++const AAUDIO_OK: AaudioResultT = 0;
++const AAUDIO_ERROR_DISCONNECTED: AaudioResultT = -899;
++const AAUDIO_ERROR_ILLEGAL_ARGUMENT: AaudioResultT = -898;
++const AAUDIO_ERROR_UNAVAILABLE: AaudioResultT = -889;
++const AAUDIO_ERROR_INVALID_FORMAT: AaudioResultT = -883;
++
++const AAUDIO_FORMAT_PCM_I16: AaudioFormatT = 1;
++const AAUDIO_FORMAT_PCM_FLOAT: AaudioFormatT = 2;
++const AAUDIO_FORMAT_PCM_I32: AaudioFormatT = 4;
++/// aaudio_direction_t
++const AAUDIO_DIRECTION_INPUT: u32 = 1;
++
++const SND_PCM_STREAM_PLAYBACK: c_int = 0;
++const SND_PCM_STREAM_CAPTURE: c_int = 1;
++const SND_PCM_NONBLOCK: c_int = 1;
++const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
++const SND_PCM_FORMAT_S16_LE: c_int = 2;
++const SND_PCM_FORMAT_S32_LE: c_int = 10;
++const SND_PCM_FORMAT_FLOAT_LE: c_int = 14;
++const EAGAIN: c_long = 11;
++const EPIPE: c_long = 32;
++const ESTRPIPE: c_long = 86;
++const RTLD_NOW: c_int = 2;
++
++const DEFAULT_RATE: i32 = 48000;
++const DEFAULT_CHANNELS: i32 = 2;
++
++type SndPcm = c_void;
++
++extern "C" {
++    fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
++    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
++}
++
++struct Alsa {
++    open: unsafe extern "C" fn(*mut *mut SndPcm, *const c_char, c_int, c_int) -> c_int,
++    set_params: unsafe extern "C" fn(*mut SndPcm, c_int, c_int, c_uint, c_uint, c_int, c_uint) -> c_int,
++    get_params: unsafe extern "C" fn(*mut SndPcm, *mut c_ulong, *mut c_ulong) -> c_int,
++    writei: unsafe extern "C" fn(*mut SndPcm, *const c_void, c_ulong) -> c_long,
++    readi: unsafe extern "C" fn(*mut SndPcm, *mut c_void, c_ulong) -> c_long,
++    wait: unsafe extern "C" fn(*mut SndPcm, c_int) -> c_int,
++    avail_update: unsafe extern "C" fn(*mut SndPcm) -> c_long,
++    recover: unsafe extern "C" fn(*mut SndPcm, c_int, c_int) -> c_int,
++    start: unsafe extern "C" fn(*mut SndPcm) -> c_int,
++    close: unsafe extern "C" fn(*mut SndPcm) -> c_int,
++    delay: unsafe extern "C" fn(*mut SndPcm, *mut c_long) -> c_int,
++    strerror: unsafe extern "C" fn(c_int) -> *const c_char,
++}
++
++fn alsa() -> Option<&'static Alsa> {
++    static ALSA: OnceLock<Option<Alsa>> = OnceLock::new();
++    ALSA.get_or_init(|| {
++        // SAFETY: dlopen/dlsym with NUL-terminated names; each symbol is transmuted to the
++        // signature libasound declares for it.
++        unsafe {
++            let lib = dlopen(c"libasound.so.2".as_ptr(), RTLD_NOW);
++            if lib.is_null() {
++                error!("host audio: libasound.so.2 cannot be loaded; the sound card stays silent");
++                return None;
++            }
++            macro_rules! sym {
++                ($name:literal) => {{
++                    let p = dlsym(lib, concat!($name, "\0").as_ptr() as *const c_char);
++                    if p.is_null() {
++                        error!("host audio: libasound.so.2 has no {}", $name);
++                        return None;
++                    }
++                    std::mem::transmute(p)
++                }};
++            }
++            Some(Alsa {
++                open: sym!("snd_pcm_open"),
++                set_params: sym!("snd_pcm_set_params"),
++                get_params: sym!("snd_pcm_get_params"),
++                writei: sym!("snd_pcm_writei"),
++                readi: sym!("snd_pcm_readi"),
++                wait: sym!("snd_pcm_wait"),
++                avail_update: sym!("snd_pcm_avail_update"),
++                recover: sym!("snd_pcm_recover"),
++                start: sym!("snd_pcm_start"),
++                close: sym!("snd_pcm_close"),
++                delay: sym!("snd_pcm_delay"),
++                strerror: sym!("snd_strerror"),
++            })
++        }
++    })
++    .as_ref()
++}
++
++fn strerror(alsa: &Alsa, err: c_int) -> String {
++    // SAFETY: snd_strerror returns a static NUL-terminated string.
++    unsafe { std::ffi::CStr::from_ptr((alsa.strerror)(err)) }
++        .to_string_lossy()
++        .into_owned()
++}
++
++#[derive(Default)]
++struct Builder {
++    direction: u32,
++    format: AaudioFormatT,
++    rate: i32,
++    channels: i32,
++    capacity: i32,
++    device_id: i32,
++}
++
++struct Stream {
++    /// Null for a stream that was asked for nothing (a probe), which never moves audio.
++    pcm: *mut SndPcm,
++    capture: bool,
++    format: AaudioFormatT,
++    rate: i32,
++    channels: i32,
++    frame_bytes: usize,
++    device_id: i32,
++    /// DROIDVM_ALSA_TRACE=1: when the queued audio (snd_pcm_delay: what crosvm has written and the speaker not yet played)
++    /// was last logged, every two seconds of playback.
++    traced: Option<Instant>,
++    /// Underruns (playback) or overruns (capture) recovered from, for the trace.
++    xruns: u64,
++}
++
++fn pcm_name(capture: bool) -> String {
++    let own = if capture {
++        "DROIDVM_ALSA_CAPTURE"
++    } else {
++        "DROIDVM_ALSA_PLAYBACK"
++    };
++    std::env::var(own)
++        .or_else(|_| std::env::var("DROIDVM_ALSA_DEVICE"))
++        .unwrap_or_else(|_| "default".to_owned())
++}
++
++#[no_mangle]
++extern "C" fn AAudio_createStreamBuilder(builder: *mut *mut AAudioStreamBuilder) -> AaudioResultT {
++    if builder.is_null() {
++        return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
++    }
++    // SAFETY: the caller passes a valid out pointer.
++    unsafe { *builder = Box::into_raw(Box::<Builder>::default()) as *mut AAudioStreamBuilder };
++    AAUDIO_OK
++}
++
++#[no_mangle]
++extern "C" fn AAudioStreamBuilder_delete(builder: *mut AAudioStreamBuilder) -> AaudioResultT {
++    if !builder.is_null() {
++        // SAFETY: made by AAudio_createStreamBuilder, deleted once.
++        drop(unsafe { Box::from_raw(builder as *mut Builder) });
++    }
++    AAUDIO_OK
++}
++
++fn with_builder(builder: *mut AAudioStreamBuilder, f: impl FnOnce(&mut Builder)) {
++    if !builder.is_null() {
++        // SAFETY: made by AAudio_createStreamBuilder and not yet deleted.
++        f(unsafe { &mut *(builder as *mut Builder) });
++    }
++}
++
++#[no_mangle]
++extern "C" fn AAudioStreamBuilder_setBufferCapacityInFrames(builder: *mut AAudioStreamBuilder, num_frames: i32) {
++    with_builder(builder, |b| b.capacity = num_frames);
++}
++
++#[no_mangle]
++extern "C" fn AAudioStreamBuilder_setDirection(builder: *mut AAudioStreamBuilder, direction: u32) {
++    with_builder(builder, |b| b.direction = direction);
++}
++
++#[no_mangle]
++extern "C" fn AAudioStreamBuilder_setFormat(builder: *mut AAudioStreamBuilder, format: AaudioFormatT) {
++    with_builder(builder, |b| b.format = format);
++}
++
++#[no_mangle]
++extern "C" fn AAudioStreamBuilder_setSampleRate(builder: *mut AAudioStreamBuilder, sample_rate: i32) {
++    with_builder(builder, |b| b.rate = sample_rate);
++}
++
++#[no_mangle]
++extern "C" fn AAudioStreamBuilder_setChannelCount(builder: *mut AAudioStreamBuilder, channel_count: i32) {
++    with_builder(builder, |b| b.channels = channel_count);
++}
++
++#[no_mangle]
++extern "C" fn AAudioStreamBuilder_setDeviceId(builder: *mut AAudioStreamBuilder, device_id: i32) {
++    with_builder(builder, |b| b.device_id = device_id);
++}
++
++/// Routing by purpose is PipeWire's (wireplumber's) business here: nothing to pass on.
++#[no_mangle]
++extern "C" fn AAudioStreamBuilder_setUsage(_builder: *mut AAudioStreamBuilder, _usage: i32) {}
++
++#[no_mangle]
++extern "C" fn AAudioStreamBuilder_setContentType(_builder: *mut AAudioStreamBuilder, _content_type: i32) {}
++
++#[no_mangle]
++extern "C" fn AAudioStreamBuilder_setInputPreset(_builder: *mut AAudioStreamBuilder, _input_preset: i32) {}
++
++#[no_mangle]
++extern "C" fn AAudioStreamBuilder_openStream(
++    builder: *mut AAudioStreamBuilder,
++    stream: *mut *mut AAudioStream,
++) -> AaudioResultT {
++    if builder.is_null() || stream.is_null() {
++        return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
++    }
++    // SAFETY: made by AAudio_createStreamBuilder and not yet deleted.
++    let b = unsafe { &*(builder as *const Builder) };
++    let capture = b.direction == AAUDIO_DIRECTION_INPUT;
++    let probe = b.format == 0 && b.rate <= 0 && b.channels <= 0;
++    let format = if b.format == 0 { AAUDIO_FORMAT_PCM_I16 } else { b.format };
++    let rate = if b.rate <= 0 { DEFAULT_RATE } else { b.rate };
++    let channels = if b.channels <= 0 { DEFAULT_CHANNELS } else { b.channels };
++    let (alsa_format, sample_bytes) = match format {
++        AAUDIO_FORMAT_PCM_I16 => (SND_PCM_FORMAT_S16_LE, 2),
++        AAUDIO_FORMAT_PCM_I32 => (SND_PCM_FORMAT_S32_LE, 4),
++        AAUDIO_FORMAT_PCM_FLOAT => (SND_PCM_FORMAT_FLOAT_LE, 4),
++        _ => return AAUDIO_ERROR_INVALID_FORMAT,
++    };
++    let mut pcm: *mut SndPcm = std::ptr::null_mut();
++    if !probe {
++        let Some(alsa) = alsa() else {
++            return AAUDIO_ERROR_UNAVAILABLE;
++        };
++        let name = pcm_name(capture);
++        let Ok(cname) = CString::new(name.clone()) else {
++            return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
++        };
++        let dir = if capture {
++            SND_PCM_STREAM_CAPTURE
++        } else {
++            SND_PCM_STREAM_PLAYBACK
++        };
++        // SAFETY: pcm is an out pointer, cname NUL-terminated.
++        let r = unsafe { (alsa.open)(&mut pcm, cname.as_ptr(), dir, SND_PCM_NONBLOCK) };
++        if r < 0 {
++            warn!("host audio: ALSA {} ({}) cannot be opened: {}", name, if capture { "capture" } else { "playback" }, strerror(alsa, r));
++            return AAUDIO_ERROR_UNAVAILABLE;
++        }
++        // Playback: DROIDVM_ALSA_LATENCY_MS (default 20) of buffer -- what crosvm keeps queued past itself, on top of the
++        // guest's own lead; PipeWire lowers its quantum to suit (measured 2026-11-09: 40 ms here meant ~54 ms queued). Capture
++        // 200 ms, room for PipeWire's quantum-sized bursts and the level the backend lets build.
++        let latency_us = if capture {
++            200_000
++        } else {
++            std::env::var("DROIDVM_ALSA_LATENCY_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20).clamp(5, 500) * 1000
++        } as c_uint;
++        // SAFETY: pcm was opened just above.
++        let r = unsafe {
++            (alsa.set_params)(pcm, alsa_format, SND_PCM_ACCESS_RW_INTERLEAVED, channels as c_uint, rate as c_uint, 1, latency_us)
++        };
++        if r < 0 {
++            warn!("host audio: ALSA {} refuses {} Hz/{} ch/format {}: {}", name, rate, channels, format, strerror(alsa, r));
++            // SAFETY: opened above, closed once.
++            unsafe { (alsa.close)(pcm) };
++            return AAUDIO_ERROR_UNAVAILABLE;
++        }
++    }
++    let s = Stream {
++        pcm,
++        capture,
++        format,
++        rate,
++        channels,
++        frame_bytes: sample_bytes * channels as usize,
++        device_id: b.device_id,
++        traced: std::env::var_os("DROIDVM_ALSA_TRACE").map(|_| Instant::now()),
++        xruns: 0,
++    };
++    // SAFETY: the caller passes a valid out pointer.
++    unsafe { *stream = Box::into_raw(Box::new(s)) as *mut AAudioStream };
++    AAUDIO_OK
++}
++
++fn stream_ref<'a>(stream: *mut AAudioStream) -> Option<&'a mut Stream> {
++    if stream.is_null() {
++        None
++    } else {
++        // SAFETY: made by AAudioStreamBuilder_openStream and not yet closed.
++        Some(unsafe { &mut *(stream as *mut Stream) })
++    }
++}
++
++#[no_mangle]
++extern "C" fn AAudioStream_getDeviceId(stream: *mut AAudioStream) -> i32 {
++    stream_ref(stream).map_or(0, |s| s.device_id)
++}
++
++#[no_mangle]
++extern "C" fn AAudioStream_getFormat(stream: *mut AAudioStream) -> AaudioFormatT {
++    stream_ref(stream).map_or(0, |s| s.format)
++}
++
++#[no_mangle]
++extern "C" fn AAudioStream_getSampleRate(stream: *mut AAudioStream) -> i32 {
++    stream_ref(stream).map_or(0, |s| s.rate)
++}
++
++#[no_mangle]
++extern "C" fn AAudioStream_getChannelCount(stream: *mut AAudioStream) -> i32 {
++    stream_ref(stream).map_or(0, |s| s.channels)
++}
++
++#[no_mangle]
++extern "C" fn AAudioStream_getBufferSizeInFrames(stream: *mut AAudioStream) -> i32 {
++    let Some(s) = stream_ref(stream) else {
++        return 0;
++    };
++    // 20 ms. The backend waits half as much again as this before its first capture read, and
++    // that wait is the level the capture ring then runs at: reported as the whole 200 ms ring it
++    // would overrun it before the first read.
++    let fallback = s.rate / 50;
++    if s.capture {
++        return fallback;
++    }
++    let Some(alsa) = alsa().filter(|_| !s.pcm.is_null()) else {
++        return fallback;
++    };
++    let (mut buffer, mut period): (c_ulong, c_ulong) = (0, 0);
++    // SAFETY: an open pcm and two out pointers.
++    if unsafe { (alsa.get_params)(s.pcm, &mut buffer, &mut period) } < 0 || buffer == 0 {
++        return fallback;
++    }
++    buffer as i32
++}
++
++#[no_mangle]
++extern "C" fn AAudioStream_requestStart(stream: *mut AAudioStream) -> AaudioResultT {
++    let Some(s) = stream_ref(stream) else {
++        return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
++    };
++    // Playback starts by itself once the first periods are written; capture has to be started.
++    if s.capture && !s.pcm.is_null() {
++        if let Some(alsa) = alsa() {
++            // SAFETY: an open pcm.
++            unsafe { (alsa.start)(s.pcm) };
++        }
++    }
++    AAUDIO_OK
++}
++
++/// Moves `num_frames` through `io` (snd_pcm_writei or snd_pcm_readi) until done or `timeout_ns`
++/// has passed: the frames moved, or a negative AAudio error once the PCM is beyond recovery.
++fn transfer(
++    s: &mut Stream,
++    num_frames: i32,
++    timeout_ns: i64,
++    mut io: impl FnMut(&Alsa, *mut SndPcm, usize, usize) -> c_long,
++) -> AaudioResultT {
++    let Some(alsa) = alsa() else {
++        return AAUDIO_ERROR_DISCONNECTED;
++    };
++    if s.pcm.is_null() || num_frames < 0 {
++        return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
++    }
++    let deadline = Instant::now() + Duration::from_nanos(timeout_ns.max(0) as u64);
++    let total = num_frames as usize;
++    let mut done = 0usize;
++    while done < total {
++        let r = io(alsa, s.pcm, done * s.frame_bytes, total - done);
++        if r > 0 {
++            done += r as usize;
++            continue;
++        }
++        if r == 0 || r == -EAGAIN {
++            let now = Instant::now();
++            if now >= deadline {
++                break;
++            }
++            let ms = (deadline - now).as_millis().clamp(1, 20) as c_int;
++            // SAFETY: an open pcm.
++            unsafe { (alsa.wait)(s.pcm, ms) };
++            continue;
++        }
++        if r == -EPIPE || r == -ESTRPIPE {
++            // Underrun (playback) or overrun (capture): prepare again and carry on.
++            s.xruns += 1;
++            // SAFETY: an open pcm.
++            if unsafe { (alsa.recover)(s.pcm, r as c_int, 1) } < 0 {
++                return AAUDIO_ERROR_DISCONNECTED;
++            }
++            if s.capture {
++                // SAFETY: an open pcm.
++                unsafe { (alsa.start)(s.pcm) };
++            }
++            continue;
++        }
++        warn!("host audio: ALSA {}: {}", if s.capture { "read" } else { "write" }, strerror(alsa, r as c_int));
++        return AAUDIO_ERROR_DISCONNECTED;
++    }
++    done as AaudioResultT
++}
++
++#[no_mangle]
++extern "C" fn AAudioStream_read(
++    stream: *mut AAudioStream,
++    buffer: *mut c_void,
++    num_frames: i32,
++    timeout_nanoseconds: i64,
++) -> AaudioResultT {
++    let Some(s) = stream_ref(stream) else {
++        return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
++    };
++    // The backend reads a period at a time without waiting (timeout 0) and expects it whole, where
++    // PipeWire hands capture over in quantum-sized bursts. A period not all there yet is read as
++    // silence and left in the ring, so the level builds back instead of every read coming up
++    // short.
++    if timeout_nanoseconds == 0 && num_frames > 0 && !buffer.is_null() && !s.pcm.is_null() {
++        if let Some(alsa) = alsa() {
++            // SAFETY: an open pcm.
++            let mut avail = unsafe { (alsa.avail_update)(s.pcm) };
++            if avail == -EPIPE || avail == -ESTRPIPE {
++                // SAFETY: an open pcm.
++                if unsafe { (alsa.recover)(s.pcm, avail as c_int, 1) } < 0 {
++                    return AAUDIO_ERROR_DISCONNECTED;
++                }
++                // SAFETY: an open pcm.
++                unsafe { (alsa.start)(s.pcm) };
++                avail = 0;
++            }
++            if avail < num_frames as c_long {
++                // SAFETY: the caller's buffer holds num_frames frames.
++                unsafe { std::ptr::write_bytes(buffer as *mut u8, 0, num_frames as usize * s.frame_bytes) };
++                return num_frames;
++            }
++        }
++    }
++    transfer(s, num_frames, timeout_nanoseconds, |alsa, pcm, offset, frames| {
++        // SAFETY: the caller's buffer holds num_frames frames; offset + frames stays within it.
++        unsafe { (alsa.readi)(pcm, (buffer as *mut u8).add(offset) as *mut c_void, frames as c_ulong) }
++    })
++}
++
++#[no_mangle]
++extern "C" fn AAudioStream_write(
++    stream: *mut AAudioStream,
++    buffer: *const c_void,
++    num_frames: i32,
++    timeout_nanoseconds: i64,
++) -> AaudioResultT {
++    let Some(s) = stream_ref(stream) else {
++        return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
++    };
++    let written = transfer(s, num_frames, timeout_nanoseconds, |alsa, pcm, offset, frames| {
++        // SAFETY: the caller's buffer holds num_frames frames; offset + frames stays within it.
++        unsafe { (alsa.writei)(pcm, (buffer as *const u8).add(offset) as *const c_void, frames as c_ulong) }
++    });
++    if let (Some(at), Some(alsa)) = (s.traced, alsa()) {
++        if at.elapsed() >= Duration::from_secs(2) && !s.pcm.is_null() {
++            s.traced = Some(Instant::now());
++            let mut queued: c_long = 0;
++            // SAFETY: an open pcm and an out pointer.
++            if unsafe { (alsa.delay)(s.pcm, &mut queued) } == 0 {
++                base::info!("host audio: {} frames ({} ms) queued past crosvm, {} underruns", queued, queued * 1000 / s.rate as c_long, s.xruns);
++            }
++        }
++    }
++    written
++}
++
++#[no_mangle]
++extern "C" fn AAudioStream_close(stream: *mut AAudioStream) -> AaudioResultT {
++    if stream.is_null() {
++        return AAUDIO_ERROR_ILLEGAL_ARGUMENT;
++    }
++    // SAFETY: made by AAudioStreamBuilder_openStream, closed once.
++    let s = unsafe { Box::from_raw(stream as *mut Stream) };
++    if !s.pcm.is_null() {
++        if let Some(alsa) = alsa() {
++            // SAFETY: an open pcm, closed once.
++            unsafe { (alsa.close)(s.pcm) };
++        }
++    }
++    AAUDIO_OK
++}
+diff --git a/devices/src/virtio/snd/common_backend/async_funcs.rs b/devices/src/virtio/snd/common_backend/async_funcs.rs
+index 7676a0b..129215a 100644
+--- a/devices/src/virtio/snd/common_backend/async_funcs.rs
++++ b/devices/src/virtio/snd/common_backend/async_funcs.rs
+@@ -246,6 +246,8 @@ struct Starvation {
+     /// Whether the endpoint wants taking or letting go, to be acted on at the top of the next
+     /// period: the buffer in hand borrows the stream for the rest of this one.
+     pending: Option<bool>,
++    /// Whether `since` counts a stop (PCM_STOP) rather than a running stream with nothing queued.
++    stopped: bool,
+ }
+ 
+ impl Starvation {
+@@ -259,6 +261,7 @@ impl Starvation {
+             since: None,
+             parked: false,
+             pending: None,
++            stopped: false,
+         }
+     }
+ 
+@@ -269,6 +272,10 @@ impl Starvation {
+     /// A period went by with nothing from the guest.
+     fn starved(&mut self, card_index: usize, direction: &str) {
+         let now = Instant::now();
++        if std::mem::take(&mut self.stopped) {
++            self.since = None;
++            self.periods = 0;
++        }
+         let since = *self.since.get_or_insert_with(|| {
+             warn!(
+                 "[Card {}] {} stream is running with nothing queued",
+@@ -287,11 +294,39 @@ impl Starvation {
+         }
+     }
+ 
++    /// A period went by with the stream stopped (PCM_STOP) and not released: nothing comes until
++    /// PCM_START. The same wait as for an unfed stream, then the host endpoint is let go -- DroidVMAudio
++    /// stops its streams between sounds and never releases them, so without this the first sound
++    /// held the speaker, and the first recording the microphone, for the rest of the session.
++    fn paused(&mut self, card_index: usize, direction: &str) {
++        let now = Instant::now();
++        let since = *self.since.get_or_insert(now);
++        self.stopped = true;
++        self.periods += 1;
++        if !self.parked && now.duration_since(since) >= Self::PARK_AFTER {
++            self.parked = true;
++            base::info!(
++                "[Card {}] {} stream stopped for {:?}; releasing the host endpoint until it starts again",
++                card_index, direction, Self::PARK_AFTER
++            );
++            self.pending = Some(true);
++        }
++    }
++
+     /// The guest queued something.
+     fn fed(&mut self, card_index: usize, direction: &str) {
+         let Some(since) = self.since.take() else {
+             return;
+         };
++        if std::mem::take(&mut self.stopped) {
++            // Started again after a stop: nothing went missing, so nothing to warn about.
++            self.periods = 0;
++            if self.parked {
++                self.parked = false;
++                self.pending = Some(false);
++            }
++            return;
++        }
+         warn!(
+             "[Card {}] {} stream resumed after {:?} with nothing queued ({} periods)",
+             card_index,
+@@ -540,6 +575,7 @@ async fn pcm_worker_loop(
+                     break Ok(());
+                 }
+                 WorkerStatus::Pause => {
++                    starvation.paused(card_index, "playback");
+                     write_data(dst_buf, None, buffer_writer, concealer).await?;
+                 }
+                 WorkerStatus::Running => match desc_receiver.try_next() {
+@@ -602,6 +638,7 @@ async fn pcm_worker_loop(
+                     break Ok(());
+                 }
+                 WorkerStatus::Pause => {
++                    starvation.paused(card_index, "capture");
+                     read_data(src_buf, None, period_bytes).await?;
+                 }
+                 WorkerStatus::Running => match desc_receiver.try_next() {

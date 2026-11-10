@@ -1,0 +1,501 @@
+syntax-ok
+--- crosvm-mmio/src/crosvm/sys/linux.rs	2026-11-10 02:12:20.637194773 +0800
++++ crosvm-ghk/src/crosvm/sys/linux.rs	2026-11-10 17:16:50.295032509 +0800
+@@ -21,6 +21,8 @@
+ mod simplefb_display;
+ #[cfg(feature = "audio")]
+ mod vcpu;
++// Kernel-first VMM stage 3: CROSVM_GHK_HANDOFF=1 runs the vcpus in ghk.ko kernel threads.
++mod ghk_handoff;
+ 
+ #[cfg(all(feature = "pvclock", target_arch = "aarch64"))]
+ use std::arch::asm;
+@@ -4514,7 +4516,12 @@
+     })();
+ 
+     let mut vcpu_handles = Vec::with_capacity(linux.vcpu_count);
+-    let vcpu_thread_barrier = Arc::new(Barrier::new(linux.vcpu_count + 1));
++    // With the ghk hand-off no vcpu thread exists, so only run_control waits on the barrier.
++    let vcpu_thread_barrier = Arc::new(Barrier::new(if ghk_handoff::enabled() {
++        1
++    } else {
++        linux.vcpu_count + 1
++    }));
+ 
+     if !linux
+         .vm
+@@ -4629,6 +4636,24 @@
+     // Architecture-specific code must supply a vcpu_init element for each VCPU.
+     assert_eq!(vcpus.len(), linux.vcpu_init.len());
+ 
++    // CROSVM_GHK_HANDOFF=1: the VM is fully built and started; give its vcpus to /dev/ghk instead of
++    // spawning vcpu threads (the loop below then sees no vcpus). Devices and run_control stay as they are.
++    let (vcpus, ghk_anchor) = if ghk_handoff::enabled() {
++        (
++            Vec::new(),
++            Some(ghk_handoff::launch(
++                &linux.vm,
++                vcpus,
++                linux.vcpu_affinity.clone(),
++                vm_evt_wrtube
++                    .try_clone()
++                    .context("failed to clone vm event tube")?,
++            )?),
++        )
++    } else {
++        (vcpus, None)
++    };
++
+     let (vcpu_pid_tid_sender, vcpu_pid_tid_receiver) = mpsc::channel();
+     for ((cpu_id, vcpu), vcpu_init) in vcpus.into_iter().enumerate().zip(linux.vcpu_init.drain(..))
+     {
+@@ -5132,6 +5157,9 @@
+             error!("failed to join vcpu thread: {:?}", e);
+         }
+     }
++    if let Some(h) = ghk_anchor {
++        h.shutdown();
++    }
+ 
+     // After joining all vcpu threads, unregister the process-wide signal handler.
+     if let Err(e) = vcpu::remove_vcpu_signal_handler() {
+--- crosvm-mmio/src/crosvm/sys/linux/ghk_handoff.rs	1970-01-01 07:30:00.000000000 +0730
++++ crosvm-ghk/src/crosvm/sys/linux/ghk_handoff.rs	1970-01-01 07:30:00.000000000 +0730
+@@ -0,0 +1,421 @@
++// Kernel-first VMM, stage 3: the crosvm "anchor".
++//
++// With CROSVM_GHK_HANDOFF=1, crosvm sets the VM up exactly as usual (memory LEND/SHARE, FDT, boot context,
++// irqfds/ioeventfds, devices, GH_VM_START and the pseudo-unprotected window share all happen in
++// `Arch::build_vm` before this runs), but instead of spawning one userspace thread per vcpu it hands the VM
++// fd and the vcpu fds to /dev/ghk (ghk.ko, ABI 2). ghk runs the vcpus in kernel threads and services MMIO
++// exits in the kernel (16550 at 0x3f8; every other read is 0, every other write is dropped). crosvm keeps its
++// device worker threads and its control loop; a monitor thread polls GHK_IOC_STATUS and, once the vcpus are
++// gone (guest SYSTEM_OFF, error, or the max_run_ms bound), stops ghk and sends the VM event that makes
++// run_control tear down normally.
++//
++// Env (all read once, at launch):
++//   CROSVM_GHK_HANDOFF=1        enable (anything else: stock vcpu threads, this file is not used)
++//   CROSVM_GHK_MAX_MS=45000     kernel-side bound for the vcpus (ghk refuses 0 or > its max_run_ms param)
++//   CROSVM_GHK_SERIAL_IRQ=1     re-bind the UART's irqfd (label 0, edge) to an eventfd ghk signals; 0 = polled
++//   CROSVM_GHK_DRY_RUN=1        GHK_LAUNCH_DRY_RUN: ghk validates and logs, no vcpu runs, crosvm exits
++//
++// Only for the tiny 1-vcpu test guest: ghk itself refuses more than max_vcpus (default 1) vcpus.
++
++use std::fs::File;
++use std::fs::OpenOptions;
++use std::os::unix::fs::OpenOptionsExt;
++use std::os::unix::io::AsRawFd;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
++use std::sync::Arc;
++use std::thread::JoinHandle;
++use std::time::Duration;
++use std::time::Instant;
++
++use anyhow::anyhow;
++use anyhow::bail;
++use anyhow::Context;
++use anyhow::Result;
++use arch::VcpuAffinity;
++use arch::VcpuArch;
++use arch::VmArch;
++use base::error;
++use base::info;
++use base::warn;
++use base::AsRawDescriptor;
++use base::Event;
++use base::SafeDescriptor;
++use base::SendTube;
++use base::VmEventType;
++
++pub fn enabled() -> bool {
++    std::env::var("CROSVM_GHK_HANDOFF").map(|v| v == "1").unwrap_or(false)
++}
++
++fn env_flag(name: &str, default: bool) -> bool {
++    match std::env::var(name) {
++        Ok(v) => v == "1",
++        Err(_) => default,
++    }
++}
++
++// ---- /dev/ghk ABI 2 (kernel-first/ghk/ghk_uapi.h) ----
++
++const GHK_ABI_VERSION: i32 = 2;
++const GHK_MAX_VCPUS: usize = 8;
++const GHK_LAUNCH_DRY_RUN: u32 = 1 << 0;
++const GHK_LAUNCH_SERIAL: u32 = 1 << 1;
++const GHK_LAUNCH_SERIAL_IRQ: u32 = 1 << 2;
++const GHK_STATUS_TIMED_OUT: u32 = 1 << 0;
++
++#[repr(C)]
++struct GhkLaunch {
++    flags: u32,
++    vm_fd: i32,
++    nr_vcpus: u32,
++    vcpu_fds: [i32; GHK_MAX_VCPUS],
++    cpu: [i32; GHK_MAX_VCPUS],
++    pad0: u32,
++    serial_base: u64,
++    serial_irqfd: i32,
++    max_run_ms: u32,
++    reserved: [u64; 3],
++}
++
++#[repr(C)]
++#[derive(Default, Debug, Clone, Copy)]
++struct GhkStatus {
++    running: u32,
++    launched: u32,
++    exits_mmio: u64,
++    exits_mmio_unhandled: u64,
++    exits_other: u64,
++    serial_bytes: u64,
++    last_error: i32,
++    vm_status: u32,
++    flags: u32,
++    exit_type: u32,
++    reserved: [u64; 3],
++}
++
++const _: () = assert!(std::mem::size_of::<GhkLaunch>() == 120);
++const _: () = assert!(std::mem::size_of::<GhkStatus>() == 80);
++
++const fn ioc(dir: u64, ty: u64, nr: u64, size: u64) -> u64 {
++    (dir << 30) | (size << 16) | (ty << 8) | nr
++}
++const GHK_TYPE: u64 = 0xB7;
++const GHK_IOC_VERSION: u64 = ioc(0, GHK_TYPE, 0x00, 0);
++const GHK_IOC_LAUNCH: u64 = ioc(1, GHK_TYPE, 0x01, 120);
++const GHK_IOC_STOP: u64 = ioc(0, GHK_TYPE, 0x02, 0);
++const GHK_IOC_STATUS: u64 = ioc(2, GHK_TYPE, 0x03, 80);
++
++// ---- Gunyah VM function ioctls (include/uapi/linux/gunyah.h), for re-binding the UART irqfd ----
++
++#[repr(C)]
++struct GhFnDesc {
++    type_: u32,
++    arg_size: u32,
++    arg: u64,
++}
++#[repr(C)]
++struct GhFnIrqfdArg {
++    fd: u32,
++    label: u32,
++    flags: u32,
++    padding: u32,
++}
++const GH_FN_IRQFD: u32 = 2;
++const GH_VM_ADD_FUNCTION: u64 = ioc(1, b'G' as u64, 0x4, 16);
++const GH_VM_REMOVE_FUNCTION: u64 = ioc(1, b'G' as u64, 0x7, 16);
++/// AARCH64_SERIAL_1_3_IRQ (aarch64/src/lib.rs): ttyS0 at 0x3f8 is SPI 0, irqfd label 0, edge.
++const SERIAL_IRQ_LABEL: u32 = 0;
++/// arch::SERIAL_ADDR[0]
++const SERIAL_BASE: u64 = 0x3f8;
++
++// Gunyah VM status / RM exit types (as in hypervisor/src/gunyah/mod.rs).
++const GH_VM_STATUS_EXITED: u32 = 2;
++const GH_RM_EXIT_TYPE_VM_EXIT: u32 = 0;
++const GH_RM_EXIT_TYPE_PSCI_POWER_OFF: u32 = 1;
++const GH_RM_EXIT_TYPE_PSCI_SYSTEM_RESET: u32 = 2;
++const GH_RM_EXIT_TYPE_PSCI_SYSTEM_RESET2: u32 = 3;
++const GH_RM_EXIT_TYPE_VM_FORCE_STOPPED: u32 = 7;
++
++fn raw_ioctl(fd: i32, nr: u64, arg: u64) -> std::io::Result<i32> {
++    // SAFETY: every caller passes a request number whose argument is either absent or a pointer to a live
++    // #[repr(C)] struct of exactly the size encoded in `nr`.
++    let r = unsafe { libc::ioctl(fd, nr as _, arg) };
++    if r < 0 {
++        Err(std::io::Error::last_os_error())
++    } else {
++        Ok(r)
++    }
++}
++
++fn gh_irqfd(vm_fd: i32, add: bool, evt_fd: i32, label: u32) -> std::io::Result<i32> {
++    let arg = GhFnIrqfdArg { fd: evt_fd as u32, label, flags: 0, padding: 0 };
++    let desc = GhFnDesc {
++        type_: GH_FN_IRQFD,
++        arg_size: std::mem::size_of::<GhFnIrqfdArg>() as u32,
++        arg: &arg as *const GhFnIrqfdArg as u64,
++    };
++    raw_ioctl(
++        vm_fd,
++        if add { GH_VM_ADD_FUNCTION } else { GH_VM_REMOVE_FUNCTION },
++        &desc as *const GhFnDesc as u64,
++    )
++}
++
++/// Point the UART's doorbell at a fresh eventfd that ghk can signal. crosvm's own serial device keeps the
++/// original event, but in this mode it never sees an MMIO access, so it never fires. The label must be
++/// removed first: re-adding a taken label "succeeds" in gunyah_vm_add_resource_ticket without a resource.
++fn rebind_serial_irq(vm_fd: i32) -> Option<Event> {
++    let evt = match Event::new() {
++        Ok(e) => e,
++        Err(e) => {
++            warn!("GHK: no eventfd for the serial irq ({e}); serial stays polled");
++            return None;
++        }
++    };
++    if let Err(e) = gh_irqfd(vm_fd, false, -1, SERIAL_IRQ_LABEL) {
++        warn!("GHK: GH_VM_REMOVE_FUNCTION(irqfd label {SERIAL_IRQ_LABEL}) failed: {e}; serial stays polled");
++        return None;
++    }
++    match gh_irqfd(vm_fd, true, evt.as_raw_descriptor(), SERIAL_IRQ_LABEL) {
++        Ok(_) => {
++            info!("GHK: serial irqfd label {SERIAL_IRQ_LABEL} re-bound to a ghk eventfd");
++            Some(evt)
++        }
++        Err(e) => {
++            error!("GHK: GH_VM_ADD_FUNCTION(irqfd label {SERIAL_IRQ_LABEL}) failed: {e}; serial is polled, no IRQ");
++            None
++        }
++    }
++}
++
++fn host_cpu(affinity: &Option<VcpuAffinity>, vcpu: usize) -> i32 {
++    let set = match affinity {
++        Some(VcpuAffinity::Global(s)) => Some(s),
++        Some(VcpuAffinity::PerVcpu(m)) => m.get(&vcpu),
++        None => None,
++    };
++    match set {
++        Some(s) if s.len() == 1 => s[0] as i32,
++        Some(s) if !s.is_empty() => {
++            warn!("GHK: vcpu{vcpu} affinity {:?} is not a single CPU; ghk runs it unbound", &s[..]);
++            -1
++        }
++        _ => -1,
++    }
++}
++
++#[cfg(feature = "gunyah")]
++fn gunyah_vcpu_fd(v: &dyn hypervisor::Vcpu) -> Option<i32> {
++    v.downcast_ref::<hypervisor::gunyah::GunyahVcpu>()
++        .map(|g| g.as_raw_descriptor())
++}
++#[cfg(not(feature = "gunyah"))]
++fn gunyah_vcpu_fd(_v: &dyn hypervisor::Vcpu) -> Option<i32> {
++    None
++}
++
++fn status(ghk: &File) -> std::io::Result<GhkStatus> {
++    let mut st = GhkStatus::default();
++    raw_ioctl(ghk.as_raw_fd(), GHK_IOC_STATUS, &mut st as *mut GhkStatus as u64)?;
++    Ok(st)
++}
++
++/// Owner of the hand-off: the monitor thread, and a flag that asks it to stop the vcpus early.
++pub struct GhkHandoff {
++    stop: Arc<AtomicBool>,
++    thread: Option<JoinHandle<()>>,
++}
++
++impl GhkHandoff {
++    /// Called by run_control after its main loop: stop the kernel vcpus (if still running) and wait.
++    pub fn shutdown(mut self) {
++        self.stop.store(true, Ordering::SeqCst);
++        if let Some(t) = self.thread.take() {
++            if t.join().is_err() {
++                error!("GHK: monitor thread panicked");
++            }
++        }
++    }
++}
++
++/// Hand the (already started) VM's vcpus to /dev/ghk. `vcpus` are the pre-created vcpus from
++/// `RunnableLinuxVm::vcpus`; they are kept alive by the monitor thread until ghk has let go of them.
++pub fn launch<V: VmArch, Vcpu: VcpuArch + 'static>(
++    vm: &V,
++    vcpus: Vec<Option<Vcpu>>,
++    affinity: Option<VcpuAffinity>,
++    vm_evt_wrtube: SendTube,
++) -> Result<GhkHandoff> {
++    let n = vcpus.len();
++    if n == 0 || n > GHK_MAX_VCPUS {
++        bail!("GHK: {n} vcpus (1..={GHK_MAX_VCPUS} supported)");
++    }
++    let vcpus: Vec<Vcpu> = vcpus
++        .into_iter()
++        .collect::<Option<Vec<_>>>()
++        .ok_or_else(|| anyhow!("GHK: vcpus were not pre-created (not the Gunyah aarch64 path)"))?;
++    let mut req = GhkLaunch {
++        flags: GHK_LAUNCH_SERIAL,
++        vm_fd: -1,
++        nr_vcpus: n as u32,
++        vcpu_fds: [-1; GHK_MAX_VCPUS],
++        cpu: [-1; GHK_MAX_VCPUS],
++        pad0: 0,
++        serial_base: SERIAL_BASE,
++        serial_irqfd: -1,
++        max_run_ms: 0,
++        reserved: [0; 3],
++    };
++    for (i, v) in vcpus.iter().enumerate() {
++        req.vcpu_fds[i] =
++            gunyah_vcpu_fd(v.as_vcpu()).ok_or_else(|| anyhow!("GHK: vcpu{i} is not a Gunyah vcpu"))?;
++        req.cpu[i] = host_cpu(&affinity, i);
++    }
++    let vm_desc: SafeDescriptor = vm.try_clone_descriptor().context("GHK: dup VM fd")?;
++    req.vm_fd = vm_desc.as_raw_descriptor();
++
++    let max_ms: u32 = std::env::var("CROSVM_GHK_MAX_MS")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(45_000);
++    req.max_run_ms = max_ms;
++    let dry_run = env_flag("CROSVM_GHK_DRY_RUN", false);
++    if dry_run {
++        req.flags |= GHK_LAUNCH_DRY_RUN;
++    }
++    let serial_evt = if env_flag("CROSVM_GHK_SERIAL_IRQ", true) {
++        rebind_serial_irq(req.vm_fd)
++    } else {
++        None
++    };
++    if let Some(e) = &serial_evt {
++        req.flags |= GHK_LAUNCH_SERIAL_IRQ;
++        req.serial_irqfd = e.as_raw_descriptor();
++    }
++
++    let ghk = OpenOptions::new()
++        .read(true)
++        .write(true)
++        .custom_flags(libc::O_CLOEXEC)
++        .open("/dev/ghk")
++        .context("GHK: open /dev/ghk (is ghk.ko loaded?)")?;
++    let abi = raw_ioctl(ghk.as_raw_fd(), GHK_IOC_VERSION, 0).context("GHK: GHK_IOC_VERSION")?;
++    if abi != GHK_ABI_VERSION {
++        bail!("GHK: /dev/ghk speaks ABI {abi}, this crosvm needs {GHK_ABI_VERSION} (load ghk.ko.new)");
++    }
++
++    info!(
++        "GHK: handing off vm fd {} + {} vcpu fd(s) {:?} (host cpus {:?}), serial {:#x} irq {}, max {} ms{}",
++        req.vm_fd,
++        n,
++        &req.vcpu_fds[..n],
++        &req.cpu[..n],
++        SERIAL_BASE,
++        if serial_evt.is_some() { "eventfd" } else { "polled" },
++        max_ms,
++        if dry_run { " (dry run)" } else { "" }
++    );
++    let launched = match raw_ioctl(ghk.as_raw_fd(), GHK_IOC_LAUNCH, &req as *const GhkLaunch as u64) {
++        Ok(_) if dry_run => {
++            info!("GHK: dry run accepted; no vcpu ran, shutting the VM down");
++            Ok(false)
++        }
++        Ok(_) => {
++            info!("GHK: launched; vcpus now run in ghk kernel threads");
++            Ok(true)
++        }
++        Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
++            warn!("GHK: launch refused (EPERM: allow_launch=0 or policy, see dmesg); no vcpu ran");
++            Ok(false)
++        }
++        Err(e) => Err(e),
++    };
++    let launched = match launched {
++        Ok(l) => l,
++        Err(e) => {
++            error!("GHK: GHK_IOC_LAUNCH failed: {e} (see dmesg 'ghk:'); no vcpu ran");
++            false
++        }
++    };
++
++    let stop = Arc::new(AtomicBool::new(false));
++    let stop_t = stop.clone();
++    let thread = std::thread::Builder::new()
++        .name("ghk_anchor".into())
++        .spawn(move || {
++            let ev = monitor(&ghk, launched, max_ms, &stop_t);
++            // Release order: ghk lets go of the vcpu/VM files (STOP above), then our vcpu objects and the
++            // dup'd VM fd go, then the event wakes run_control, which tears the VM down as usual.
++            drop(ghk);
++            drop(vcpus);
++            drop(vm_desc);
++            drop(serial_evt);
++            if !stop_t.load(Ordering::SeqCst) {
++                info!("GHK: reporting {:?} to run_control", ev);
++                if let Err(e) = vm_evt_wrtube.send::<VmEventType>(&ev) {
++                    error!("GHK: failed to send {:?}: {}", ev, e);
++                }
++            }
++        })
++        .context("GHK: spawn monitor thread")?;
++    Ok(GhkHandoff { stop, thread: Some(thread) })
++}
++
++fn monitor(ghk: &File, launched: bool, max_ms: u32, stop: &AtomicBool) -> VmEventType {
++    if !launched {
++        return VmEventType::Exit;
++    }
++    let t0 = Instant::now();
++    // ghk enforces max_ms in the kernel; this is a second, userspace bound in case the threads do not leave.
++    let hard = Duration::from_millis(u64::from(max_ms) + 5_000);
++    let mut last_log = Instant::now();
++    let mut st = GhkStatus::default();
++    loop {
++        if stop.load(Ordering::SeqCst) {
++            info!("GHK: run_control is exiting; stopping the kernel vcpus");
++            break;
++        }
++        match status(ghk) {
++            Ok(s) => st = s,
++            Err(e) => {
++                error!("GHK: GHK_IOC_STATUS: {e}");
++                break;
++            }
++        }
++        if st.running == 0 {
++            break;
++        }
++        if t0.elapsed() > hard {
++            error!("GHK: vcpus still running {:?} after the kernel bound; forcing GHK_IOC_STOP", t0.elapsed());
++            break;
++        }
++        if last_log.elapsed() > Duration::from_secs(5) {
++            info!("GHK: t={:.1}s {:?}", t0.elapsed().as_secs_f32(), st);
++            last_log = Instant::now();
++        }
++        std::thread::sleep(Duration::from_millis(50));
++    }
++    if let Err(e) = raw_ioctl(ghk.as_raw_fd(), GHK_IOC_STOP, 0) {
++        error!("GHK: GHK_IOC_STOP: {e}");
++    }
++    if let Ok(s) = status(ghk) {
++        // counters survive STOP; running/launched are 0 now
++        st = GhkStatus { running: st.running, launched: st.launched, ..s };
++    }
++    info!("GHK: vcpus done after {:.2}s: {:?}", t0.elapsed().as_secs_f32(), st);
++    if st.flags & GHK_STATUS_TIMED_OUT != 0 {
++        warn!("GHK: the guest did not power off within {max_ms} ms (kernel bound hit)");
++        return VmEventType::Crash;
++    }
++    if st.last_error != 0 || st.vm_status != GH_VM_STATUS_EXITED {
++        return VmEventType::Crash;
++    }
++    match st.exit_type {
++        GH_RM_EXIT_TYPE_VM_EXIT | GH_RM_EXIT_TYPE_PSCI_POWER_OFF | GH_RM_EXIT_TYPE_VM_FORCE_STOPPED => {
++            VmEventType::Exit
++        }
++        GH_RM_EXIT_TYPE_PSCI_SYSTEM_RESET | GH_RM_EXIT_TYPE_PSCI_SYSTEM_RESET2 => VmEventType::Reset,
++        _ => VmEventType::Crash,
++    }
++}
+--- crosvm-mmio/build-ghk.sh	1970-01-01 07:30:00.000000000 +0730
++++ crosvm-ghk/build-ghk.sh	1970-01-01 07:30:00.000000000 +0730
+@@ -0,0 +1,13 @@
++#!/bin/bash
++# Build the stage-3 anchor variant (CROSVM_GHK_HANDOFF) from the COPY ~/vm/src/crosvm-ghk and install it as
++# ~/vm/bin/crosvm-ghk only. Same features/env as ~/vm/build-crosvm-gpu.sh; never touches crosvm-mmio-gpu.
++set -u
++export http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890 all_proxy=http://127.0.0.1:7890
++source $HOME/.cargo/env
++P=$HOME/vm/opt/virgl; L=$HOME/vm/logs; mkdir -p $L
++PC=$(dirname $(find $P -name virglrenderer.pc | head -1))
++cd $HOME/vm/src/crosvm-ghk
++FEAT=gunyah,audio,audio_aaudio,libaaudio_alsa,balloon,config-file,qcow,net,gpu,usb,vnc,virgl_renderer,media
++BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/aarch64-linux-gnu CROSVM_USE_SYSTEM_VIRGLRENDERER=1 CROSVM_USE_SYSTEM_MINIGBM=1 PKG_CONFIG_PATH=$PC nice -n 15 ionice -c3 cargo +1.86.0 build --release -j ${JOBS:-2} --no-default-features --features "$FEAT" > $L/crosvm-ghk.log 2>&1
++rc=$?; echo "rc=$rc" >> $L/crosvm-ghk.log
++[ $rc = 0 ] && cp target/release/crosvm $HOME/vm/bin/crosvm-ghk.new && mv -f $HOME/vm/bin/crosvm-ghk.new $HOME/vm/bin/crosvm-ghk && echo installed >> $L/crosvm-ghk.log

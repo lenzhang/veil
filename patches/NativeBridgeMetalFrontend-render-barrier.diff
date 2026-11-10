@@ -1,0 +1,36 @@
+--- /tmp/NativeBridgeMetalFrontend.mm.bak	2026-11-10 01:27:55
++++ NativeBridgeMetalFrontend.mm	2026-11-10 02:38:41
+@@ -42,7 +42,6 @@
+ #include <signal.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <unistd.h>
+ #include <sys/stat.h>
+ #include "bridge/NativeMetalObjects.h"
+ #include "NativeBridgeMetalFrontend.h"
+@@ -2752,7 +2751,25 @@
+ @interface NBRenderEncoder : NBEncoder
+ @property(nonatomic) uint64_t passKey;   // colour 0 format | load << 16 | surface << 18 | big << 19
+ @end
++// Render-pass barriers off while /Library/Preferences/com.droidvm.nmb-no-render-barrier exists (read once per process; a process
++// whose sandbox cannot see the file keeps them on): the A/B switch for them without restaging the plugin.
++static bool nbRenderBarriers() {
++ static int on = -1;
++ if (on < 0) on = access("/Library/Preferences/com.droidvm.nmb-no-render-barrier", F_OK) != 0;
++ return on;
++}
+ @implementation NBRenderEncoder
++// Render-pass memory barriers (the bridge splits the pass): RenderBox reads back, in the same encoder, the coverage an earlier draw
++// accumulated in a render target; dropped, SwiftUI glyphs and IconRendering icons drew as blocks or nothing (piano, 2026-11-10).
++- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {
++ if (!nbRenderBarriers()) return;
++ ENCODE([self check:nmb_render_memory_barrier(self.handle,scope,after,before) what:"render memory barrier"]);
++}
++- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {
++ (void)resources;(void)count;
++ if (!nbRenderBarriers()) return;
++ ENCODE([self check:nmb_render_memory_barrier(self.handle,MTLBarrierScopeBuffers|MTLBarrierScopeTextures|MTLBarrierScopeRenderTargets,after,before) what:"render memory barrier"]);
++}
+ - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
+  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+  if(dumpDescribes())self.dumpPipeline=state;

@@ -1,0 +1,19 @@
+The engine ring is a whole number of periods. Upstream sized it 8192 frames, which 240-frame periods do not divide: the
+period at frames 7952..8191 ran 832 bytes past the end of the ring, read by droidvm_snd_play and then zeroed by the engine.
+On the piano (Linux host, PipeWire) the page after the speaker ring was unmapped: a kernel data abort in memmove the first
+time Safari played a sound (2026-11-09).
+
+--- a/DroidVMAudio.cpp
++++ b/DroidVMAudio.cpp
+@@ -64,7 +64,10 @@
+ 
+ namespace {
+ enum : uint32_t {
+-    Rate = 48000, RingFrames = 8192, PeriodFrames = 240,   // 5 ms
++    // The ring a whole number of periods (32, 160 ms): the engine moves a period at a time and never splits one at the wrap, so
++    // with 8192 frames (not a multiple of 240) the period at 7952..8191 ran 832 bytes past the ring's end -- read by
++    // droidvm_snd_play's memcpy and then cleared by the bzero after it (a kernel data abort where the next page is unmapped).
++    Rate = 48000, RingFrames = 32 * 240, PeriodFrames = 240,   // 5 ms
+     OutputChannels = 2, InputChannels = 1, StreamID = 1,
+     SafetyOffset = 2 * PeriodFrames, Latency = PeriodFrames,
+     OutputLead = 8 * PeriodFrames,   // the silence the transport queues ahead as the output starts (DroidVMVirtioSnd.c's SND_PREFILL)

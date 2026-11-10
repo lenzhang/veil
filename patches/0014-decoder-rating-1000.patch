@@ -1,0 +1,13 @@
+--- a/DroidVMVTHost.cpp	2026-11-10 03:19:57
++++ b/DroidVMVTHost.cpp	2026-11-10 03:19:57
+@@ -2263,7 +2263,9 @@
+             const int type = p->string(codecs[i][0]);
+             const int keys[5] = {p->string("VTCodecType"), p->string("CMClassImplementationName"), p->string("IsPreferredInternalPlugin"),
+                                  p->string("VTRating"), p->string("CMClassImplementationID")};
+-            const int values[5] = {p->array(&type, 1), p->string(codecs[i][2]), p->boolean(false), p->integer(400), p->string(codecs[i][1])};
++            // Rated above every decoder of Apple's for the codec (avd 400, gva, vcp 200): with 400 VideoToolbox kept HEVC on its own GPU/software
++            // decoders (no session ever reached the device; H.264 came here as avd's hardware is absent).
++            const int values[5] = {p->array(&type, 1), p->string(codecs[i][2]), p->boolean(false), p->integer(1000), p->string(codecs[i][1])};
+             entries[i] = p->dict(keys, values, 5);
+         }
+         const int list = p->array(entries, decoderDevice() == ~0u ? 0 : 2);

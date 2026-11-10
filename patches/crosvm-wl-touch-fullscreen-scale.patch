@@ -1,0 +1,594 @@
+diff --git a/gpu_display/build.rs b/gpu_display/build.rs
+index 7554138..9564c13 100644
+--- a/gpu_display/build.rs
++++ b/gpu_display/build.rs
+@@ -103,6 +103,19 @@ fn build_wayland() {
+     println!("cargo:rustc-link-lib=dylib=wayland-client");
+ }
+ 
++// piano: soong 里 libvnc_server_bridge 是单独的 cc_library_static；cargo 构建要自己编它（vnc feature）
++fn build_vnc() {
++    let mut build = cc::Build::new();
++    build.flag("-std=gnu11");
++    build.include("src");
++    build.file("src/vnc_server_bridge.c");
++    build.file("src/vnc_h264_rfb.c");
++    println!("cargo:rerun-if-changed=src/vnc_server_bridge.c");
++    println!("cargo:rerun-if-changed=src/vnc_h264_rfb.c");
++    build.compile("vnc_server_bridge");
++    println!("cargo:rustc-link-lib=dylib=vncserver");
++}
++
+ fn main() {
+     // Skip installing dependencies when generating documents.
+     if std::env::var("CARGO_DOC").is_ok() {
+@@ -112,6 +125,9 @@ fn main() {
+     match std::env::var("CARGO_CFG_TARGET_OS").as_deref().unwrap() {
+         "linux" | "android" => {
+             build_wayland();
++            if env::var("CARGO_FEATURE_VNC").is_ok() {
++                build_vnc();
++            }
+         }
+         _ => {}
+     }
+diff --git a/gpu_display/src/display_wl.c b/gpu_display/src/display_wl.c
+index b195c42..5c540ea 100644
+--- a/gpu_display/src/display_wl.c
++++ b/gpu_display/src/display_wl.c
+@@ -35,6 +35,9 @@
+ #define DEFAULT_SCALE 2
+ #define MAX_BUFFER_COUNT 64
+ #define EVENT_BUF_SIZE 256
++#define DWL_TOUCH_SLOTS 10
++// The left button's emulated contact: the last slot, the touch screen's fingers the others.
++#define DWL_POINTER_TOUCH_SLOT (DWL_TOUCH_SLOTS - 1)
+ 
+ const int32_t DWL_KEYBOARD_KEY_STATE_RELEASED = WL_KEYBOARD_KEY_STATE_RELEASED;
+ const int32_t DWL_KEYBOARD_KEY_STATE_PRESSED  = WL_KEYBOARD_KEY_STATE_PRESSED;
+@@ -92,6 +95,16 @@ struct input {
+ 	int32_t pointer_x;
+ 	int32_t pointer_y;
+ 	bool pointer_lbutton_state;
++	// DroidVM: the seat's touch screen (wl_touch). A compositor gives a Wayland client a touch
++	// screen's contacts on wl_touch only -- neither mutter nor wlroots emulates a pointer for one --
++	// so without it real touches never reached the guest. Wayland touch ids are mapped to
++	// multi-touch slots (the guest's DroidVMInput keeps 10).
++	struct wl_touch *wl_touch;
++	struct {
++		bool active;
++		int32_t id;
++		struct wl_surface *surface;
++	} touch_slots[DWL_TOUCH_SLOTS];
+ };
+ 
+ typedef void (*dwl_error_callback_type)(const char *message);
+@@ -285,6 +298,11 @@ static void wl_keyboard_enter(void *data, struct wl_keyboard *wl_keyboard,
+ 	uint32_t *key;
+ 	struct dwl_event event = {0};
+ 	input->keyboard_input_surface = surface;
++	// DroidVM: tell the device side the window has the keyboard focus (logged there: whether a
++	// fullscreen VM window got the focus is otherwise invisible).
++	event.surface_descriptor = surface;
++	event.event_type = DWL_EVENT_TYPE_KEYBOARD_ENTER;
++	dwl_context_push_event(context, &event);
+ 	wl_array_for_each(key, keys) {
+ 		event.surface_descriptor = input->keyboard_input_surface;
+ 		event.event_type = DWL_EVENT_TYPE_KEYBOARD_KEY;
+@@ -360,6 +378,29 @@ static const struct wl_keyboard_listener wl_keyboard_listener = {
+ 	.repeat_info = wl_keyboard_repeat_info,
+ };
+ 
++// DroidVM: wl_pointer/wl_touch coordinates are the surface's logical ones; the virtio touch device
++// spans the guest's buffer (the display's pixels). On a scale-2 output (GNOME on the tablet) a
++// 3200x2136 buffer is a 1600x1068 surface, and a tap at the far corner reached the guest as its
++// middle. The surface's own scale is what its viewport divides the buffer by (surface_enter).
++static double dwl_input_scale(struct dwl_context *context, struct wl_surface *wl_surface)
++{
++	size_t i;
++	for (i = 0; i < MAX_BUFFER_COUNT; i++) {
++		struct dwl_surface *surface = context->surfaces[i];
++		if (surface && surface->wl_surface == wl_surface && surface->scale > 0)
++			return surface->scale;
++	}
++	return 1.0;
++}
++
++static int32_t dwl_input_coord(struct dwl_context *context, struct wl_surface *wl_surface,
++			       wl_fixed_t value)
++{
++	if (!wl_surface)
++		return wl_fixed_to_int(value);
++	return (int32_t)(wl_fixed_to_double(value) * dwl_input_scale(context, wl_surface));
++}
++
+ static void pointer_enter_handler(void *data, struct wl_pointer *wl_pointer,
+ 				  uint32_t serial, struct wl_surface *surface,
+ 				  wl_fixed_t x, wl_fixed_t y)
+@@ -370,8 +411,8 @@ static void pointer_enter_handler(void *data, struct wl_pointer *wl_pointer,
+ 	(void)serial;
+ 
+ 	input->pointer_input_surface = surface;
+-	input->pointer_x = wl_fixed_to_int(x);
+-	input->pointer_y = wl_fixed_to_int(y);
++	input->pointer_x = dwl_input_coord(context, surface, x);
++	input->pointer_y = dwl_input_coord(context, surface, y);
+ }
+ 
+ static void pointer_leave_handler(void *data, struct wl_pointer *wl_pointer,
+@@ -395,13 +436,14 @@ static void pointer_motion_handler(void *data, struct wl_pointer *wl_pointer,
+ 	(void)wl_pointer;
+ 	(void)time;
+ 
+-	input->pointer_x = wl_fixed_to_int(x);
+-	input->pointer_y = wl_fixed_to_int(y);
++	input->pointer_x = dwl_input_coord(context, input->pointer_input_surface, x);
++	input->pointer_y = dwl_input_coord(context, input->pointer_input_surface, y);
+ 	if (input->pointer_lbutton_state) {
+ 		event.surface_descriptor = input->pointer_input_surface;
+ 		event.event_type = DWL_EVENT_TYPE_TOUCH_MOTION;
+ 		event.params[0] = input->pointer_x;
+ 		event.params[1] = input->pointer_y;
++		event.params[2] = DWL_POINTER_TOUCH_SLOT;
+ 		dwl_context_push_event(context, &event);
+ 	}
+ }
+@@ -425,6 +467,7 @@ static void pointer_button_handler(void *data, struct wl_pointer *wl_pointer,
+ 			DWL_EVENT_TYPE_TOUCH_DOWN:DWL_EVENT_TYPE_TOUCH_UP;
+ 		event.params[0] = input->pointer_x;
+ 		event.params[1] = input->pointer_y;
++		event.params[2] = DWL_POINTER_TOUCH_SLOT;
+ 		dwl_context_push_event(context, &event);
+ 	}
+ }
+@@ -483,6 +526,143 @@ const struct wl_pointer_listener wl_pointer_listener = {
+ 	.axis_discrete = wl_pointer_axis_discrete,
+ };
+ 
++// DroidVM: wl_touch. params: x, y (buffer pixels), slot.
++static int dwl_touch_slot(struct input *input, int32_t id)
++{
++	int i;
++	for (i = 0; i < DWL_TOUCH_SLOTS; i++)
++		if (input->touch_slots[i].active && input->touch_slots[i].id == id)
++			return i;
++	return -1;
++}
++
++static void wl_touch_down(void *data, struct wl_touch *wl_touch, uint32_t serial, uint32_t time,
++			  struct wl_surface *surface, int32_t id, wl_fixed_t x, wl_fixed_t y)
++{
++	struct dwl_context *context = (struct dwl_context *)data;
++	struct input *input = &context->input;
++	struct dwl_event event = {0};
++	int slot;
++	(void)wl_touch;
++	(void)serial;
++	(void)time;
++
++	if (dwl_touch_slot(input, id) >= 0)
++		return;
++	for (slot = 0; slot < DWL_POINTER_TOUCH_SLOT; slot++)
++		if (!input->touch_slots[slot].active)
++			break;
++	if (slot == DWL_POINTER_TOUCH_SLOT)
++		return; // more fingers than the guest keeps
++	input->touch_slots[slot].active = true;
++	input->touch_slots[slot].id = id;
++	input->touch_slots[slot].surface = surface;
++	event.surface_descriptor = surface;
++	event.event_type = DWL_EVENT_TYPE_TOUCH_DOWN;
++	event.params[0] = dwl_input_coord(context, surface, x);
++	event.params[1] = dwl_input_coord(context, surface, y);
++	event.params[2] = slot;
++	dwl_context_push_event(context, &event);
++}
++
++static void wl_touch_up(void *data, struct wl_touch *wl_touch, uint32_t serial, uint32_t time,
++			int32_t id)
++{
++	struct dwl_context *context = (struct dwl_context *)data;
++	struct input *input = &context->input;
++	struct dwl_event event = {0};
++	int slot = dwl_touch_slot(input, id);
++	(void)wl_touch;
++	(void)serial;
++	(void)time;
++
++	if (slot < 0)
++		return;
++	event.surface_descriptor = input->touch_slots[slot].surface;
++	event.event_type = DWL_EVENT_TYPE_TOUCH_UP;
++	event.params[2] = slot;
++	input->touch_slots[slot].active = false;
++	input->touch_slots[slot].surface = NULL;
++	dwl_context_push_event(context, &event);
++}
++
++static void wl_touch_motion(void *data, struct wl_touch *wl_touch, uint32_t time, int32_t id,
++			    wl_fixed_t x, wl_fixed_t y)
++{
++	struct dwl_context *context = (struct dwl_context *)data;
++	struct input *input = &context->input;
++	struct dwl_event event = {0};
++	int slot = dwl_touch_slot(input, id);
++	(void)wl_touch;
++	(void)time;
++
++	if (slot < 0)
++		return;
++	event.surface_descriptor = input->touch_slots[slot].surface;
++	event.event_type = DWL_EVENT_TYPE_TOUCH_MOTION;
++	event.params[0] = dwl_input_coord(context, input->touch_slots[slot].surface, x);
++	event.params[1] = dwl_input_coord(context, input->touch_slots[slot].surface, y);
++	event.params[2] = slot;
++	dwl_context_push_event(context, &event);
++}
++
++static void wl_touch_frame(void *data, struct wl_touch *wl_touch)
++{
++	(void)data;
++	(void)wl_touch;
++}
++
++// The compositor took the touch sequence over (a GNOME edge swipe or three-finger gesture):
++// every contact ends.
++static void wl_touch_cancel(void *data, struct wl_touch *wl_touch)
++{
++	struct dwl_context *context = (struct dwl_context *)data;
++	struct input *input = &context->input;
++	int slot;
++	(void)wl_touch;
++
++	for (slot = 0; slot < DWL_TOUCH_SLOTS; slot++) {
++		struct dwl_event event = {0};
++		if (!input->touch_slots[slot].active)
++			continue;
++		event.surface_descriptor = input->touch_slots[slot].surface;
++		event.event_type = DWL_EVENT_TYPE_TOUCH_UP;
++		event.params[2] = slot;
++		input->touch_slots[slot].active = false;
++		input->touch_slots[slot].surface = NULL;
++		dwl_context_push_event(context, &event);
++	}
++}
++
++static void wl_touch_shape(void *data, struct wl_touch *wl_touch, int32_t id, wl_fixed_t major,
++			   wl_fixed_t minor)
++{
++	(void)data;
++	(void)wl_touch;
++	(void)id;
++	(void)major;
++	(void)minor;
++}
++
++static void wl_touch_orientation(void *data, struct wl_touch *wl_touch, int32_t id,
++				 wl_fixed_t orientation)
++{
++	(void)data;
++	(void)wl_touch;
++	(void)id;
++	(void)orientation;
++}
++
++static const struct wl_touch_listener wl_touch_listener = {
++	.down = wl_touch_down,
++	.up = wl_touch_up,
++	.motion = wl_touch_motion,
++	.frame = wl_touch_frame,
++	.cancel = wl_touch_cancel,
++	.shape = wl_touch_shape,
++	.orientation = wl_touch_orientation,
++};
++
+ static void wl_seat_capabilities(void *data, struct wl_seat *wl_seat,
+ 				 uint32_t capabilities)
+ {
+@@ -490,6 +670,7 @@ static void wl_seat_capabilities(void *data, struct wl_seat *wl_seat,
+ 	struct input *input = &context->input;
+ 	bool have_keyboard = capabilities & WL_SEAT_CAPABILITY_KEYBOARD;
+ 	bool have_pointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
++	bool have_touch = capabilities & WL_SEAT_CAPABILITY_TOUCH;
+ 
+ 	if (have_keyboard && input->wl_keyboard == NULL) {
+ 		input->wl_keyboard = wl_seat_get_keyboard(wl_seat);
+@@ -506,6 +687,15 @@ static void wl_seat_capabilities(void *data, struct wl_seat *wl_seat,
+ 		wl_pointer_release(input->wl_pointer);
+ 		input->wl_pointer = NULL;
+ 	}
++
++	if (have_touch && input->wl_touch == NULL) {
++		input->wl_touch = wl_seat_get_touch(wl_seat);
++		wl_touch_add_listener(input->wl_touch, &wl_touch_listener, context);
++	} else if (!have_touch && input->wl_touch != NULL) {
++		wl_touch_cancel(context, input->wl_touch);
++		wl_touch_release(input->wl_touch);
++		input->wl_touch = NULL;
++	}
+ }
+ 
+ static void wl_seat_name(void *data, struct wl_seat *wl_seat, const char *name)
+@@ -693,6 +883,11 @@ static void surface_enter(void *data, struct wl_surface *wl_surface,
+ 
+ 	surface->scale = (output->device_scale_factor / 1000.0) *
+ 			 (output->current_scale / 1000.0);
++	// DroidVM: CROSVM_WL_SURFACE_SCALE=1 shows the guest's buffer pixel for logical pixel on a scaled output (the
++	// thin host's kiosk: a 1600x1068 guest on the 3200x2136 panel at scale 2 fills it, upscaled by the compositor).
++	const char *forced_scale = getenv("CROSVM_WL_SURFACE_SCALE");
++	if (forced_scale && atof(forced_scale) > 0)
++		surface->scale = atof(forced_scale);
+ 
+ 	if (surface->viewport) {
+ 		wp_viewport_set_destination(
+@@ -1089,6 +1284,12 @@ struct dwl_surface *dwl_context_surface_new(struct dwl_context *self,
+ 			goto fail;
+ 		}
+ 		xdg_toplevel_set_title(disp_surface->xdg_toplevel, "crosvm");
++		// DroidVM: CROSVM_WL_FULLSCREEN=1 asks the compositor to show the screen full screen (GNOME: the VM on the
++		// tablet's panel; cage makes every window full screen anyway). App id for desktop entries and window rules.
++		xdg_toplevel_set_app_id(disp_surface->xdg_toplevel, "droidvm-macos");
++		const char *fullscreen = getenv("CROSVM_WL_FULLSCREEN");
++		if (fullscreen && fullscreen[0] == '1')
++			xdg_toplevel_set_fullscreen(disp_surface->xdg_toplevel, NULL);
+ 		xdg_toplevel_add_listener(disp_surface->xdg_toplevel,
+ 					      &toplevel_listener, disp_surface);
+ 
+diff --git a/gpu_display/src/gpu_display_wl.rs b/gpu_display/src/gpu_display_wl.rs
+index 1ef11ac..cfd1b48 100644
+--- a/gpu_display/src/gpu_display_wl.rs
++++ b/gpu_display/src/gpu_display_wl.rs
+@@ -23,6 +23,7 @@ use std::ptr::null;
+ 
+ use anyhow::bail;
+ use base::error;
++use base::info;
+ use base::round_up_to_page_size;
+ use base::AsRawDescriptor;
+ use base::MemoryMapping;
+@@ -205,8 +206,22 @@ pub struct DisplayWl {
+     ctx: DwlContext,
+     current_event: Option<dwl_event>,
+     mt_tracking_id: u16,
++    // DroidVM: per-slot tracking ids of the contacts down (wl_touch fingers and the left button's
++    // emulated one, the slots display_wl.c gives them), -1 for none.
++    mt_slots: [i32; MT_SLOTS],
++    // Keys the guest has seen pressed, released when the window loses the keyboard focus (a
++    // Super or Alt held to switch away would otherwise stay down in the guest).
++    keys_down: Vec<u16>,
++    // How many touch-downs / keys have been logged (the first few only: proof that input flows).
++    touches_logged: u32,
++    keys_logged: u32,
++    unmatched_logged: bool,
+ }
+ 
++/// display_wl.c's DWL_TOUCH_SLOTS.
++const MT_SLOTS: usize = 10;
++const INPUT_LOG_LIMIT: u32 = 8;
++
+ /// Error logging callback used by wrapped C implementation.
+ ///
+ /// # Safety
+@@ -267,6 +282,11 @@ impl DisplayWl {
+             ctx,
+             current_event: None,
+             mt_tracking_id: 0u16,
++            mt_slots: [-1; MT_SLOTS],
++            keys_down: Vec::new(),
++            touches_logged: 0,
++            keys_logged: 0,
++            unmatched_logged: false,
+         })
+     }
+ 
+@@ -289,10 +309,6 @@ impl DisplayWl {
+         self.mt_tracking_id = self.mt_tracking_id.wrapping_add(1);
+         cur_id
+     }
+-
+-    fn current_tracking_id(&self) -> i32 {
+-        self.mt_tracking_id as i32
+-    }
+ }
+ 
+ impl DisplayT for DisplayWl {
+@@ -317,30 +333,65 @@ impl DisplayT for DisplayWl {
+         let event = self.current_event.take().unwrap();
+ 
+         match event.event_type {
+-            DWL_EVENT_TYPE_KEYBOARD_ENTER => None,
+-            DWL_EVENT_TYPE_KEYBOARD_LEAVE => None,
++            DWL_EVENT_TYPE_KEYBOARD_ENTER => {
++                info!("wayland: the VM window has the keyboard focus");
++                None
++            }
++            DWL_EVENT_TYPE_KEYBOARD_LEAVE => {
++                info!("wayland: the VM window lost the keyboard focus");
++                if self.keys_down.is_empty() {
++                    return None;
++                }
++                let events = self
++                    .keys_down
++                    .drain(..)
++                    .map(|key| virtio_input_event::key(key, false, false))
++                    .collect();
++                Some(GpuDisplayEvents {
++                    events,
++                    device_type: EventDeviceKind::Keyboard,
++                })
++            }
+             DWL_EVENT_TYPE_KEYBOARD_KEY => {
+                 let linux_keycode = event.params[0] as u16;
+                 let pressed = event.params[1] == DWL_KEYBOARD_KEY_STATE_PRESSED;
++                if pressed {
++                    if !self.keys_down.contains(&linux_keycode) {
++                        self.keys_down.push(linux_keycode);
++                    }
++                    if self.keys_logged < INPUT_LOG_LIMIT {
++                        self.keys_logged += 1;
++                        // Not the key code: this is a log file.
++                        info!("wayland: key press {} to the guest", self.keys_logged);
++                    }
++                } else {
++                    self.keys_down.retain(|key| *key != linux_keycode);
++                }
+                 let events = vec![virtio_input_event::key(linux_keycode, pressed, false)];
+                 Some(GpuDisplayEvents {
+                     events,
+                     device_type: EventDeviceKind::Keyboard,
+                 })
+             }
+-            // TODO(tutankhamen): slot is always 0, because all the input
+-            // events come from mouse device, i.e. only one touch is possible at a time.
+-            // Full MT protocol has to be implemented and properly wired later.
++            // DroidVM: real multi-touch. params: x and y in the buffer's pixels (the touch
++            // device's range: the display size), and the slot (wl_touch fingers 0..8, the left
++            // button's emulated contact 9).
+             DWL_EVENT_TYPE_TOUCH_DOWN | DWL_EVENT_TYPE_TOUCH_MOTION => {
+-                let tracking_id = if event.event_type == DWL_EVENT_TYPE_TOUCH_DOWN {
+-                    self.next_tracking_id()
+-                } else {
+-                    self.current_tracking_id()
+-                };
+-
++                let slot = event.params[2].clamp(0, MT_SLOTS as i32 - 1);
++                let down = event.event_type == DWL_EVENT_TYPE_TOUCH_DOWN;
++                if down || self.mt_slots[slot as usize] < 0 {
++                    self.mt_slots[slot as usize] = self.next_tracking_id();
++                }
++                if down && self.touches_logged < INPUT_LOG_LIMIT {
++                    self.touches_logged += 1;
++                    info!(
++                        "wayland: touch down slot {} at {},{} to the guest",
++                        slot, event.params[0], event.params[1]
++                    );
++                }
+                 let events = vec![
+-                    virtio_input_event::multitouch_slot(0),
+-                    virtio_input_event::multitouch_tracking_id(tracking_id),
++                    virtio_input_event::multitouch_slot(slot),
++                    virtio_input_event::multitouch_tracking_id(self.mt_slots[slot as usize]),
+                     virtio_input_event::multitouch_absolute_x(max(0, event.params[0])),
+                     virtio_input_event::multitouch_absolute_y(max(0, event.params[1])),
+                     virtio_input_event::touch(true),
+@@ -351,10 +402,13 @@ impl DisplayT for DisplayWl {
+                 })
+             }
+             DWL_EVENT_TYPE_TOUCH_UP => {
++                let slot = event.params[2].clamp(0, MT_SLOTS as i32 - 1);
++                self.mt_slots[slot as usize] = -1;
++                let any_down = self.mt_slots.iter().any(|id| *id >= 0);
+                 let events = vec![
+-                    virtio_input_event::multitouch_slot(0),
++                    virtio_input_event::multitouch_slot(slot),
+                     virtio_input_event::multitouch_tracking_id(-1),
+-                    virtio_input_event::touch(false),
++                    virtio_input_event::touch(any_down),
+                 ];
+                 Some(GpuDisplayEvents {
+                     events,
+@@ -368,6 +422,20 @@ impl DisplayT for DisplayWl {
+         }
+     }
+ 
++    fn handle_next_event_without_surface(&mut self) -> Option<GpuDisplayEvents> {
++        // DroidVM: input for a wl_surface that is no display surface (it used to be dropped
++        // silently, and with it any clue why the guest got nothing).
++        let event = self.current_event.take()?;
++        if !self.unmatched_logged {
++            self.unmatched_logged = true;
++            info!(
++                "wayland: input event {:#x} for surface {:?}, which no display surface is; dropped",
++                event.event_type, event.surface_descriptor
++            );
++        }
++        None
++    }
++
+     fn flush(&self) {
+         // SAFETY:
+         // Safe given that the context pointer is valid.
+diff --git a/gpu_display/src/lib.rs b/gpu_display/src/lib.rs
+index 9b7bb38..89c969c 100644
+--- a/gpu_display/src/lib.rs
++++ b/gpu_display/src/lib.rs
+@@ -79,6 +79,8 @@ pub const DRM_FORMAT_XBGR8888: u32 = drm_fourcc(b'X', b'B', b'2', b'4');
+ pub const DRM_FORMAT_ABGR8888: u32 = drm_fourcc(b'A', b'B', b'2', b'4');
+ pub const DRM_FORMAT_RGB888: u32 = drm_fourcc(b'R', b'G', b'2', b'4');
+ pub const DRM_FORMAT_RGB565: u32 = drm_fourcc(b'R', b'G', b'1', b'6');
++/// piano: R, G, B, A half floats in memory (the macOS guest's 'RGhA' framebuffer)
++pub const DRM_FORMAT_ABGR16161616F: u32 = drm_fourcc(b'A', b'B', b'4', b'H');
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ enum PixelLayout {
+@@ -89,6 +91,30 @@ enum PixelLayout {
+     /// B, G, R in memory on a little-endian host.
+     BlueFirst888,
+     Rgb565,
++    /// R, G, B, A half floats in memory.
++    RedFirstHalf,
++}
++
++/// A half float in [0, 1] as a byte (below 0 and NaN are 0, 1 and above 255), for every half: one table, made once.
++fn half_to_byte_table() -> &'static [u8; 65536] {
++    static TABLE: std::sync::OnceLock<Box<[u8; 65536]>> = std::sync::OnceLock::new();
++    TABLE.get_or_init(|| {
++        let mut table = Box::new([0u8; 65536]);
++        for (bits, out) in table.iter_mut().enumerate() {
++            let bits = bits as u32;
++            let exponent = (bits >> 10) & 31;
++            let mantissa = bits & 1023;
++            let value = if bits & 0x8000 != 0 || (exponent == 31 && mantissa != 0) {
++                0.0
++            } else if exponent == 0 {
++                mantissa as f32 / 1024.0 / 16384.0
++            } else {
++                (1.0 + mantissa as f32 / 1024.0) * 2f32.powi(exponent as i32 - 15)
++            };
++            *out = (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
++        }
++        table
++    })
+ }
+ 
+ impl PixelLayout {
+@@ -97,6 +123,7 @@ impl PixelLayout {
+             Self::BlueFirst8888 | Self::RedFirst8888 => 4,
+             Self::BlueFirst888 => 3,
+             Self::Rgb565 => 2,
++            Self::RedFirstHalf => 8,
+         }
+     }
+ }
+@@ -107,6 +134,7 @@ fn pixel_layout(fourcc: u32) -> Option<PixelLayout> {
+         DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888 => Some(PixelLayout::RedFirst8888),
+         DRM_FORMAT_RGB888 => Some(PixelLayout::BlueFirst888),
+         DRM_FORMAT_RGB565 => Some(PixelLayout::Rgb565),
++        DRM_FORMAT_ABGR16161616F => Some(PixelLayout::RedFirstHalf),
+         _ => None,
+     }
+ }
+@@ -138,9 +166,14 @@ fn convert_scanout_row(
+         return false;
+     }
+ 
++    let halves = half_to_byte_table();
+     for pixel in 0..width {
+         let source = &source[pixel * source_bpp..];
+         let (r, g, b, a) = match source_layout {
++            PixelLayout::RedFirstHalf => {
++                let half = |i: usize| halves[u16::from_le_bytes([source[2 * i], source[2 * i + 1]]) as usize];
++                (half(0), half(1), half(2), half(3))
++            }
+             PixelLayout::BlueFirst8888 => (source[2], source[1], source[0], source[3]),
+             PixelLayout::RedFirst8888 => (source[0], source[1], source[2], source[3]),
+             PixelLayout::BlueFirst888 => (source[2], source[1], source[0], 0xff),
+@@ -156,7 +189,7 @@ fn convert_scanout_row(
+         match target_layout {
+             PixelLayout::BlueFirst8888 => target[..4].copy_from_slice(&[b, g, r, a]),
+             PixelLayout::RedFirst8888 => target[..4].copy_from_slice(&[r, g, b, a]),
+-            PixelLayout::BlueFirst888 | PixelLayout::Rgb565 => unreachable!(),
++            PixelLayout::BlueFirst888 | PixelLayout::Rgb565 | PixelLayout::RedFirstHalf => unreachable!(),
+         }
+     }
+     true

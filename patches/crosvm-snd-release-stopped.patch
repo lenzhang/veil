@@ -1,0 +1,88 @@
+diff --git a/devices/src/virtio/snd/common_backend/async_funcs.rs b/devices/src/virtio/snd/common_backend/async_funcs.rs
+index 7676a0b..129215a 100644
+--- a/devices/src/virtio/snd/common_backend/async_funcs.rs
++++ b/devices/src/virtio/snd/common_backend/async_funcs.rs
+@@ -246,6 +246,8 @@ struct Starvation {
+     /// Whether the endpoint wants taking or letting go, to be acted on at the top of the next
+     /// period: the buffer in hand borrows the stream for the rest of this one.
+     pending: Option<bool>,
++    /// Whether `since` counts a stop (PCM_STOP) rather than a running stream with nothing queued.
++    stopped: bool,
+ }
+ 
+ impl Starvation {
+@@ -259,6 +261,7 @@ impl Starvation {
+             since: None,
+             parked: false,
+             pending: None,
++            stopped: false,
+         }
+     }
+ 
+@@ -269,6 +272,10 @@ impl Starvation {
+     /// A period went by with nothing from the guest.
+     fn starved(&mut self, card_index: usize, direction: &str) {
+         let now = Instant::now();
++        if std::mem::take(&mut self.stopped) {
++            self.since = None;
++            self.periods = 0;
++        }
+         let since = *self.since.get_or_insert_with(|| {
+             warn!(
+                 "[Card {}] {} stream is running with nothing queued",
+@@ -287,11 +294,39 @@ impl Starvation {
+         }
+     }
+ 
++    /// A period went by with the stream stopped (PCM_STOP) and not released: nothing comes until
++    /// PCM_START. The same wait as for an unfed stream, then the host endpoint is let go -- DroidVMAudio
++    /// stops its streams between sounds and never releases them, so without this the first sound
++    /// held the speaker, and the first recording the microphone, for the rest of the session.
++    fn paused(&mut self, card_index: usize, direction: &str) {
++        let now = Instant::now();
++        let since = *self.since.get_or_insert(now);
++        self.stopped = true;
++        self.periods += 1;
++        if !self.parked && now.duration_since(since) >= Self::PARK_AFTER {
++            self.parked = true;
++            base::info!(
++                "[Card {}] {} stream stopped for {:?}; releasing the host endpoint until it starts again",
++                card_index, direction, Self::PARK_AFTER
++            );
++            self.pending = Some(true);
++        }
++    }
++
+     /// The guest queued something.
+     fn fed(&mut self, card_index: usize, direction: &str) {
+         let Some(since) = self.since.take() else {
+             return;
+         };
++        if std::mem::take(&mut self.stopped) {
++            // Started again after a stop: nothing went missing, so nothing to warn about.
++            self.periods = 0;
++            if self.parked {
++                self.parked = false;
++                self.pending = Some(false);
++            }
++            return;
++        }
+         warn!(
+             "[Card {}] {} stream resumed after {:?} with nothing queued ({} periods)",
+             card_index,
+@@ -540,6 +575,7 @@ async fn pcm_worker_loop(
+                     break Ok(());
+                 }
+                 WorkerStatus::Pause => {
++                    starvation.paused(card_index, "playback");
+                     write_data(dst_buf, None, buffer_writer, concealer).await?;
+                 }
+                 WorkerStatus::Running => match desc_receiver.try_next() {
+@@ -602,6 +638,7 @@ async fn pcm_worker_loop(
+                     break Ok(());
+                 }
+                 WorkerStatus::Pause => {
++                    starvation.paused(card_index, "capture");
+                     read_data(src_buf, None, period_bytes).await?;
+                 }
+                 WorkerStatus::Running => match desc_receiver.try_next() {

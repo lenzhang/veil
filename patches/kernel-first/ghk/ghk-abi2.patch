@@ -1,0 +1,286 @@
+--- stage2-orig/ghk_main.c	2026-11-10 17:12:19
++++ ghk/ghk_main.c	2026-11-10 17:13:28
+@@ -10,6 +10,12 @@
+  * given and logs what it would do; no thread is created and no vcpu is run. Nothing in this module creates a
+  * VM, maps memory or talks to the resource manager.
+  *
++ * Stage 3 (ABI 2) guards on the live path, all load-time-only:
++ *   max_vcpus  (default 1)      refuse any VM handed over with more vcpus (the macOS VM has 6: never accepted)
++ *   max_run_ms (default 120000) every live launch must carry a bound <= this; when it expires a timer kicks the
++ *                               vcpu threads out of GUNYAH_VCPU_RUN (immediate_exit + SIGKILL) and they park
++ * The 16550 THRE interrupt is an eventfd the anchor registered as GUNYAH_FN_IRQFD for the UART's SPI (edge).
++ *
+  * Built against the exact running tree (O=~/piano-kbuild/out/kernel-usb1): it reads struct gunyah_vm (private,
+  * drivers/virt/gunyah/vm_mgr.h) for mm_s, and the public struct gunyah_vcpu. CONFIG_MODVERSIONS is off, so a
+  * layout mismatch is NOT caught at load time -- never load this against another build.
+@@ -52,6 +58,14 @@
+ module_param(allow_launch, bool, 0444);
+ MODULE_PARM_DESC(allow_launch, "Actually run vcpus in kernel threads on GHK_IOC_LAUNCH (default off: validate and log only)");
+ 
++static unsigned int max_vcpus = 1;
++module_param(max_vcpus, uint, 0444);
++MODULE_PARM_DESC(max_vcpus, "Refuse launches with more vcpus than this (default 1: the tiny test guest only)");
++
++static unsigned int max_run_ms = 120000;
++module_param(max_run_ms, uint, 0444);
++MODULE_PARM_DESC(max_run_ms, "Upper bound for ghk_launch.max_run_ms (a live launch must set 1..this)");
++
+ static bool verbose = true;
+ module_param(verbose, bool, 0644);
+ MODULE_PARM_DESC(verbose, "Log every launch decision");
+@@ -71,7 +85,7 @@
+ 	u64 base;
+ 	u8 ier, lcr, mcr, scr, dll, dlm;
+ 	bool thri_pending;
+-	struct eventfd_ctx *irq;	/* reserved for the irqfd hand-off (not wired in the skeleton) */
++	struct eventfd_ctx *irq;	/* GUNYAH_FN_IRQFD eventfd of the UART's SPI (edge), or NULL: polled only */
+ 	char line[256];
+ 	unsigned int len;
+ 	u64 bytes;
+@@ -205,6 +219,9 @@
+ 	atomic_t running;
+ 	int last_error;
+ 	u32 vm_status;
++	u32 exit_type;
++	struct timer_list deadline;	/* max_run_ms bound of a live launch */
++	bool timed_out;
+ };
+ 
+ static bool ghk_file_is(struct file *f, const char *owner, const char *name, bool prefix)
+@@ -258,14 +275,14 @@
+ 
+ 	allow_signal(SIGKILL);	/* GHK_IOC_STOP / release interrupt the vcpu's interruptible waits */
+ 	kthread_use_mm(vm->mm);	/* gunyah_vcpu_run() and demand paging require current->mm == ghvm->mm_s */
+-	atomic_inc(&vm->running);
++	/* vm->running was set to nr_vcpus by ghk_launch() before the wake-up, so STATUS never sees a false 0 */
+ 	pr_info("vcpu%u: thread %d running on %s CPU %d\n", kv->index, current->pid,
+ 		kv->cpu >= 0 ? "bound" : "any", kv->cpu >= 0 ? kv->cpu : raw_smp_processor_id());
+ 
+-	while (!kthread_should_stop()) {
++	while (!kthread_should_stop() && !READ_ONCE(vm->timed_out)) {
+ 		r = kv->file->f_op->unlocked_ioctl(kv->file, GUNYAH_VCPU_RUN, 0);
+ 		if (r == -ERESTARTSYS || r == -EINTR) {
+-			if (fatal_signal_pending(current) || kthread_should_stop())
++			if (fatal_signal_pending(current) || kthread_should_stop() || READ_ONCE(vm->timed_out))
+ 				break;
+ 			flush_signals(current);
+ 			continue;
+@@ -281,6 +298,7 @@
+ 			break;
+ 		case GUNYAH_VCPU_EXIT_STATUS:
+ 			vm->vm_status = run->status.status;
++			vm->exit_type = run->status.exit_info.type;
+ 			pr_info("vcpu%u: VM status %u (exit type %u reason %u)\n", kv->index,
+ 				run->status.status, run->status.exit_info.type,
+ 				run->status.exit_info.reason_size);
+@@ -312,6 +330,24 @@
+ 	return 0;
+ }
+ 
++/* max_run_ms expired: kick every vcpu thread out of GUNYAH_VCPU_RUN; they leave their loop and park. */
++static void ghk_deadline(struct timer_list *t)
++{
++	struct ghk_vm *vm = container_of(t, struct ghk_vm, deadline);
++	unsigned int i;
++
++	WRITE_ONCE(vm->timed_out, true);
++	for (i = 0; i < vm->nr_vcpus; i++) {
++		struct ghk_vcpu *kv = &vm->vcpus[i];
++
++		if (!kv->task)
++			continue;
++		WRITE_ONCE(kv->vcpu->vcpu_run->immediate_exit, 1);
++		send_sig(SIGKILL, kv->task, 1);
++	}
++	pr_warn("max_run_ms expired: vcpu threads kicked out\n");
++}
++
+ static void ghk_release_files(struct ghk_vm *vm)
+ {
+ 	unsigned int i;
+@@ -340,6 +376,7 @@
+ 
+ 	if (!vm->launched)
+ 		return;
++	timer_delete_sync(&vm->deadline);	/* before any task_struct reference goes away */
+ 	for (i = 0; i < vm->nr_vcpus; i++) {
+ 		struct ghk_vcpu *kv = &vm->vcpus[i];
+ 
+@@ -368,13 +405,24 @@
+ 		return -EFAULT;
+ 	if (!req.nr_vcpus || req.nr_vcpus > GHK_MAX_VCPUS)
+ 		return -EINVAL;
++	if (req.nr_vcpus > max_vcpus) {
++		pr_warn("refusing %u vcpus (max_vcpus=%u): not the test guest\n", req.nr_vcpus, max_vcpus);
++		return -EPERM;
++	}
+ 	if (req.pad0)
+ 		return -EINVAL;
+ 	for (i = 0; i < ARRAY_SIZE(req.reserved); i++)
+ 		if (req.reserved[i])
+ 			return -EINVAL;
+-	if (req.flags & ~(GHK_LAUNCH_DRY_RUN | GHK_LAUNCH_SERIAL))
++	if (req.flags & ~(GHK_LAUNCH_DRY_RUN | GHK_LAUNCH_SERIAL | GHK_LAUNCH_SERIAL_IRQ))
+ 		return -EINVAL;
++	if ((req.flags & GHK_LAUNCH_SERIAL_IRQ) && !(req.flags & GHK_LAUNCH_SERIAL))
++		return -EINVAL;
++	if (allow_launch && !(req.flags & GHK_LAUNCH_DRY_RUN) &&
++	    (!req.max_run_ms || req.max_run_ms > max_run_ms)) {
++		pr_warn("refusing live launch: max_run_ms %u not in 1..%u\n", req.max_run_ms, max_run_ms);
++		return -EINVAL;
++	}
+ 	if (vm->launched)
+ 		return -EBUSY;
+ 
+@@ -421,11 +469,22 @@
+ 	vm->nr_vcpus = req.nr_vcpus;
+ 	vm->serial = req.flags & GHK_LAUNCH_SERIAL;
+ 	vm->uart.base = req.serial_base;
++	if (req.flags & GHK_LAUNCH_SERIAL_IRQ) {
++		struct eventfd_ctx *ctx = eventfd_ctx_fdget(req.serial_irqfd);
+ 
++		if (IS_ERR(ctx)) {
++			pr_warn("serial_irqfd %d is not an eventfd\n", req.serial_irqfd);
++			ret = PTR_ERR(ctx);
++			goto err;
++		}
++		vm->uart.irq = ctx;
++	}
++
+ 	if (verbose) {
+-		pr_info("launch request from pid %d: vmid %u, %u vcpu(s), serial %s at %#llx%s\n",
++		pr_info("launch request from pid %d: vmid %u, %u vcpu(s), serial %s at %#llx, irq %s, max %u ms%s\n",
+ 			current->pid, vm->ghvm->vmid, req.nr_vcpus, vm->serial ? "on" : "off",
+-			req.serial_base, (req.flags & GHK_LAUNCH_DRY_RUN) ? " (dry run)" : "");
++			req.serial_base, vm->uart.irq ? "eventfd" : "none", req.max_run_ms,
++			(req.flags & GHK_LAUNCH_DRY_RUN) ? " (dry run)" : "");
+ 		for (i = 0; i < req.nr_vcpus; i++)
+ 			pr_info("  would run vcpu%u (label %u, state %d) in a kthread with the caller's mm, %s %d\n",
+ 				i, vm->vcpus[i].vcpu->ticket.label, vm->vcpus[i].vcpu->state,
+@@ -445,6 +504,8 @@
+ 	atomic64_set(&vm->exits_other, 0);
+ 	vm->last_error = 0;
+ 	vm->vm_status = 0;
++	vm->exit_type = 0;
++	vm->timed_out = false;
+ 	vm->launched = true;
+ 	for (i = 0; i < vm->nr_vcpus; i++) {
+ 		struct ghk_vcpu *kv = &vm->vcpus[i];
+@@ -461,8 +522,11 @@
+ 			kthread_bind(t, kv->cpu);
+ 		kv->task = t;
+ 	}
++	atomic_set(&vm->running, vm->nr_vcpus);
++	mod_timer(&vm->deadline, jiffies + msecs_to_jiffies(req.max_run_ms));
+ 	for (i = 0; i < vm->nr_vcpus; i++)
+ 		wake_up_process(vm->vcpus[i].task);
++	pr_info("launched %u vcpu thread(s), bound %u ms\n", vm->nr_vcpus, req.max_run_ms);
+ 	return 0;
+ 
+ err:
+@@ -491,6 +555,9 @@
+ 		return 0;
+ 	case GHK_IOC_STATUS:
+ 		st.running = atomic_read(&vm->running);
++		st.launched = vm->launched;
++		st.flags = READ_ONCE(vm->timed_out) ? GHK_STATUS_TIMED_OUT : 0;
++		st.exit_type = vm->exit_type;
+ 		st.exits_mmio = atomic64_read(&vm->exits_mmio);
+ 		st.exits_mmio_unhandled = atomic64_read(&vm->exits_mmio_unhandled);
+ 		st.exits_other = atomic64_read(&vm->exits_other);
+@@ -510,6 +577,7 @@
+ 		return -ENOMEM;
+ 	mutex_init(&vm->lock);
+ 	spin_lock_init(&vm->uart.lock);
++	timer_setup(&vm->deadline, ghk_deadline, 0);
+ 	filp->private_data = vm;
+ 	return 0;
+ }
+@@ -546,8 +614,8 @@
+ 
+ 	if (ret)
+ 		return ret;
+-	pr_info("stage-2 skeleton loaded: /dev/ghk, ABI %d, allow_launch=%d%s\n", GHK_ABI_VERSION,
+-		allow_launch, allow_launch ? "" : " (validate-and-log only)");
++	pr_info("loaded: /dev/ghk, ABI %d, allow_launch=%d%s, max_vcpus=%u, max_run_ms=%u\n", GHK_ABI_VERSION,
++		allow_launch, allow_launch ? "" : " (validate-and-log only)", max_vcpus, max_run_ms);
+ 	return 0;
+ }
+ 
+@@ -559,6 +627,6 @@
+ 
+ module_init(ghk_init);
+ module_exit(ghk_exit);
+-MODULE_DESCRIPTION("Gunyah kernel launcher (kernel-first VMM, stage-2 skeleton)");
++MODULE_DESCRIPTION("Gunyah kernel launcher (kernel-first VMM, stage-3 anchor ABI 2)");
+ MODULE_LICENSE("GPL");
+ MODULE_SOFTDEP("pre: gunyah_rsc_mgr gunyah_vcpu");
+--- stage2-orig/ghk_uapi.h	2026-11-10 17:12:19
++++ ghk/ghk_uapi.h	2026-11-10 17:13:14
+@@ -1,11 +1,16 @@
+ /* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
+ /*
+- * ghk: Gunyah kernel launcher -- userspace ABI (stage-2 skeleton).
++ * ghk: Gunyah kernel launcher -- userspace ABI.
+  *
+  * The anchor process creates the VM with the stock /dev/gunyah ioctls (create, memory, DTB, boot context,
+  * vcpu functions, START) and then hands the VM fd and the vcpu fds to /dev/ghk. ghk runs the vcpus in kernel
+  * threads that borrow the anchor's mm (the in-tree driver insists on ghvm->mm_s) and services MMIO exits
+  * in the kernel. The anchor keeps /dev/ghk open for the life of the VM; closing it stops the vcpu threads.
++ *
++ * ABI 2 (stage 3, crosvm-ghk anchor): serial_irqfd + GHK_LAUNCH_SERIAL_IRQ (edge interrupt of the in-kernel
++ * 16550, an eventfd the anchor registered with GUNYAH_FN_IRQFD), max_run_ms (mandatory kernel-side bound on a
++ * live launch), status.launched / status.flags. Struct sizes are unchanged (120 / 80 bytes); fields carved out
++ * of the old reserved space.
+  */
+ #ifndef _UAPI_GHK_H
+ #define _UAPI_GHK_H
+@@ -14,34 +19,42 @@
+ #include <linux/types.h>
+ 
+ #define GHK_IOCTL_TYPE		0xB7
+-#define GHK_ABI_VERSION		1
++#define GHK_ABI_VERSION		2
+ #define GHK_MAX_VCPUS		8
+ 
+ /* ghk_launch.flags */
+ #define GHK_LAUNCH_DRY_RUN	(1u << 0)	/* validate and log only, even with allow_launch=1 */
+ #define GHK_LAUNCH_SERIAL	(1u << 1)	/* model a 16550 at serial_base in the kernel */
++#define GHK_LAUNCH_SERIAL_IRQ	(1u << 2)	/* serial_irqfd is valid: signal it on THRE interrupts (edge) */
+ 
+ struct ghk_launch {
+ 	__u32 flags;
+ 	__s32 vm_fd;				/* anon_inode:gunyah-vm of the caller */
+-	__u32 nr_vcpus;				/* 1..GHK_MAX_VCPUS */
++	__u32 nr_vcpus;				/* 1..min(GHK_MAX_VCPUS, max_vcpus module param) */
+ 	__s32 vcpu_fds[GHK_MAX_VCPUS];		/* anon_inode:gh-vcpu:N of the caller */
+ 	__s32 cpu[GHK_MAX_VCPUS];		/* host CPU to bind vcpu i to, -1 = unbound */
+ 	__u32 pad0;				/* must be 0 (explicit: serial_base is 8-aligned) */
+ 	__u64 serial_base;			/* guest PA of the 16550 (crosvm: 0x3f8), 8 bytes wide */
+-	__u64 reserved[4];			/* must be 0 */
++	__s32 serial_irqfd;			/* eventfd; only read with GHK_LAUNCH_SERIAL_IRQ */
++	__u32 max_run_ms;			/* live launch: 1..max_run_ms module param, then the vcpus are kicked out */
++	__u64 reserved[3];			/* must be 0 */
+ };
+ 
++/* ghk_status.flags */
++#define GHK_STATUS_TIMED_OUT	(1u << 0)	/* max_run_ms expired and the vcpus were kicked out */
++
+ struct ghk_status {
+-	__u32 running;				/* number of live vcpu threads */
+-	__u32 reserved0;
++	__u32 running;				/* number of vcpu threads still inside their run loop */
++	__u32 launched;				/* 1 between a live LAUNCH and STOP/release */
+ 	__u64 exits_mmio;
+ 	__u64 exits_mmio_unhandled;
+ 	__u64 exits_other;
+ 	__u64 serial_bytes;
+ 	__s32 last_error;
+ 	__u32 vm_status;			/* GUNYAH_VM_STATUS_* seen on the last STATUS exit, 0 = none */
+-	__u64 reserved[4];
++	__u32 flags;				/* GHK_STATUS_* */
++	__u32 exit_type;			/* status.exit_info.type of the last STATUS exit */
++	__u64 reserved[3];
+ };
+ 
+ #define GHK_IOC_VERSION		_IO(GHK_IOCTL_TYPE, 0x00)	/* returns GHK_ABI_VERSION */

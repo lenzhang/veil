@@ -1,0 +1,356 @@
+--- crosvm-ghk-stage3/src/crosvm/sys/linux.rs
++++ crosvm-ghk/src/crosvm/sys/linux.rs
+@@ -21,7 +21,7 @@
+ mod simplefb_display;
+ #[cfg(feature = "audio")]
+ mod vcpu;
+-// Kernel-first VMM stage 3: CROSVM_GHK_HANDOFF=1 runs the vcpus in ghk.ko kernel threads.
++// Kernel-first VMM stage 3/4: CROSVM_GHK_HANDOFF=1 runs the vcpus in ghk.ko kernel threads (ABI 3: MMIO forwarded back).
+ mod ghk_handoff;
+ 
+ #[cfg(all(feature = "pvclock", target_arch = "aarch64"))]
+@@ -4648,6 +4648,8 @@
+                 vm_evt_wrtube
+                     .try_clone()
+                     .context("failed to clone vm event tube")?,
++                // stage 4: forwarded MMIO exits are served on the same Bus the vcpu threads would use
++                (*linux.mmio_bus).clone(),
+             )?),
+         )
+     } else {
+--- crosvm-ghk-stage3/src/crosvm/sys/linux/ghk_handoff.rs
++++ crosvm-ghk/src/crosvm/sys/linux/ghk_handoff.rs
+@@ -1,19 +1,24 @@
+-// Kernel-first VMM, stage 3: the crosvm "anchor".
++// Kernel-first VMM, stage 3 + 4: the crosvm "anchor".
+ //
+ // With CROSVM_GHK_HANDOFF=1, crosvm sets the VM up exactly as usual (memory LEND/SHARE, FDT, boot context,
+ // irqfds/ioeventfds, devices, GH_VM_START and the pseudo-unprotected window share all happen in
+ // `Arch::build_vm` before this runs), but instead of spawning one userspace thread per vcpu it hands the VM
+-// fd and the vcpu fds to /dev/ghk (ghk.ko, ABI 2). ghk runs the vcpus in kernel threads and services MMIO
+-// exits in the kernel (16550 at 0x3f8; every other read is 0, every other write is dropped). crosvm keeps its
+-// device worker threads and its control loop; a monitor thread polls GHK_IOC_STATUS and, once the vcpus are
+-// gone (guest SYSTEM_OFF, error, or the max_run_ms bound), stops ghk and sends the VM event that makes
+-// run_control tear down normally.
++// fd and the vcpu fds to /dev/ghk (ghk.ko, ABI 3). ghk runs the vcpus in kernel threads and services the
++// 16550 at 0x3f8 in the kernel. Stage 4 (ABI 3, GHK_LAUNCH_MMIO_FWD): every other MMIO exit is forwarded back
++// to this process; a `ghk_mmio` thread answers it with crosvm's own `Bus::read`/`Bus::write`, exactly what the
++// userspace vcpu loop does (vcpu.rs `VcpuExit::Mmio`), so virtio-mmio config space, pl031, pl061, PCI ECAM etc.
++// work unchanged. Queue notifies still go through Gunyah ioeventfd and interrupts through irqfd, both in the
++// kernel, so the forwarded traffic is only register accesses. crosvm keeps its device worker threads and its
++// control loop; a monitor thread polls GHK_IOC_STATUS and, once the vcpus are gone (guest SYSTEM_OFF, error,
++// or the max_run_ms bound), stops ghk and sends the VM event that makes run_control tear down normally.
+ //
+ // Env (all read once, at launch):
+ //   CROSVM_GHK_HANDOFF=1        enable (anything else: stock vcpu threads, this file is not used)
+ //   CROSVM_GHK_MAX_MS=45000     kernel-side bound for the vcpus (ghk refuses 0 or > its max_run_ms param)
+ //   CROSVM_GHK_SERIAL_IRQ=1     re-bind the UART's irqfd (label 0, edge) to an eventfd ghk signals; 0 = polled
+ //   CROSVM_GHK_DRY_RUN=1        GHK_LAUNCH_DRY_RUN: ghk validates and logs, no vcpu runs, crosvm exits
++//   CROSVM_GHK_MMIO_FWD=1       (default 1) forward non-UART MMIO exits to the Bus here; 0 = stage-3 behaviour
++//   CROSVM_GHK_MMIO_TIMEOUT_MS  (default 2000) ghk stops the vcpu if an answer takes longer (fail-stop)
+ //
+ // Only for the tiny 1-vcpu test guest: ghk itself refuses more than max_vcpus (default 1) vcpus.
+ 
+@@ -43,6 +48,7 @@
+ use base::SafeDescriptor;
+ use base::SendTube;
+ use base::VmEventType;
++use devices::Bus;
+ 
+ pub fn enabled() -> bool {
+     std::env::var("CROSVM_GHK_HANDOFF").map(|v| v == "1").unwrap_or(false)
+@@ -55,14 +61,18 @@
+     }
+ }
+ 
+-// ---- /dev/ghk ABI 2 (kernel-first/ghk/ghk_uapi.h) ----
++// ---- /dev/ghk ABI 3 (kernel-first/ghk-abi3/ghk_uapi.h) ----
+ 
+-const GHK_ABI_VERSION: i32 = 2;
++const GHK_ABI_VERSION: i32 = 3;
+ const GHK_MAX_VCPUS: usize = 8;
+ const GHK_LAUNCH_DRY_RUN: u32 = 1 << 0;
+ const GHK_LAUNCH_SERIAL: u32 = 1 << 1;
+ const GHK_LAUNCH_SERIAL_IRQ: u32 = 1 << 2;
++const GHK_LAUNCH_MMIO_FWD: u32 = 1 << 3;
+ const GHK_STATUS_TIMED_OUT: u32 = 1 << 0;
++const GHK_MMIO_COMPLETE: u32 = 1 << 0;
++/// How long one GHK_IOC_MMIO_XFER waits for a request before the server re-checks its stop flag.
++const GHK_MMIO_WAIT_MS: u32 = 100;
+ 
+ #[repr(C)]
+ struct GhkLaunch {
+@@ -75,7 +85,9 @@
+     serial_base: u64,
+     serial_irqfd: i32,
+     max_run_ms: u32,
+-    reserved: [u64; 3],
++    mmio_timeout_ms: u32,
++    pad1: u32,
++    reserved: [u64; 2],
+ }
+ 
+ #[repr(C)]
+@@ -91,11 +103,38 @@
+     vm_status: u32,
+     flags: u32,
+     exit_type: u32,
+-    reserved: [u64; 3],
++    exits_mmio_fwd: u64,
++    mmio_fwd_timeouts: u32,
++    pad: u32,
++    reserved: [u64; 1],
++}
++
++#[repr(C)]
++#[derive(Default, Debug, Clone, Copy)]
++struct GhkMmioReq {
++    seq: u64,
++    phys_addr: u64,
++    data: [u8; 8],
++    len: u32,
++    is_write: u8,
++    vcpu: u8,
++    pad: u16,
++}
++
++#[repr(C)]
++#[derive(Default, Debug, Clone, Copy)]
++struct GhkMmioXfer {
++    flags: u32,
++    wait_ms: u32,
++    done: GhkMmioReq,
++    next: GhkMmioReq,
++    reserved: [u64; 2],
+ }
+ 
+ const _: () = assert!(std::mem::size_of::<GhkLaunch>() == 120);
+ const _: () = assert!(std::mem::size_of::<GhkStatus>() == 80);
++const _: () = assert!(std::mem::size_of::<GhkMmioReq>() == 32);
++const _: () = assert!(std::mem::size_of::<GhkMmioXfer>() == 88);
+ 
+ const fn ioc(dir: u64, ty: u64, nr: u64, size: u64) -> u64 {
+     (dir << 30) | (size << 16) | (ty << 8) | nr
+@@ -105,6 +144,7 @@
+ const GHK_IOC_LAUNCH: u64 = ioc(1, GHK_TYPE, 0x01, 120);
+ const GHK_IOC_STOP: u64 = ioc(0, GHK_TYPE, 0x02, 0);
+ const GHK_IOC_STATUS: u64 = ioc(2, GHK_TYPE, 0x03, 80);
++const GHK_IOC_MMIO_XFER: u64 = ioc(3, GHK_TYPE, 0x04, 88);
+ 
+ // ---- Gunyah VM function ioctls (include/uapi/linux/gunyah.h), for re-binding the UART irqfd ----
+ 
+@@ -241,11 +281,14 @@
+ 
+ /// Hand the (already started) VM's vcpus to /dev/ghk. `vcpus` are the pre-created vcpus from
+ /// `RunnableLinuxVm::vcpus`; they are kept alive by the monitor thread until ghk has let go of them.
++/// `mmio_bus` is a clone of `linux.mmio_bus` (the same object every userspace vcpu thread gets); the
++/// `ghk_mmio` thread serves forwarded MMIO exits with it and is joined before `shutdown()` returns.
+ pub fn launch<V: VmArch, Vcpu: VcpuArch + 'static>(
+     vm: &V,
+     vcpus: Vec<Option<Vcpu>>,
+     affinity: Option<VcpuAffinity>,
+     vm_evt_wrtube: SendTube,
++    mmio_bus: Bus,
+ ) -> Result<GhkHandoff> {
+     let n = vcpus.len();
+     if n == 0 || n > GHK_MAX_VCPUS {
+@@ -265,7 +308,9 @@
+         serial_base: SERIAL_BASE,
+         serial_irqfd: -1,
+         max_run_ms: 0,
+-        reserved: [0; 3],
++        mmio_timeout_ms: 0,
++        pad1: 0,
++        reserved: [0; 2],
+     };
+     for (i, v) in vcpus.iter().enumerate() {
+         req.vcpu_fds[i] =
+@@ -285,6 +330,14 @@
+     if dry_run {
+         req.flags |= GHK_LAUNCH_DRY_RUN;
+     }
++    let mmio_fwd = env_flag("CROSVM_GHK_MMIO_FWD", true);
++    if mmio_fwd {
++        req.flags |= GHK_LAUNCH_MMIO_FWD;
++        req.mmio_timeout_ms = std::env::var("CROSVM_GHK_MMIO_TIMEOUT_MS")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(2_000);
++    }
+     let serial_evt = if env_flag("CROSVM_GHK_SERIAL_IRQ", true) {
+         rebind_serial_irq(req.vm_fd)
+     } else {
+@@ -303,11 +356,12 @@
+         .context("GHK: open /dev/ghk (is ghk.ko loaded?)")?;
+     let abi = raw_ioctl(ghk.as_raw_fd(), GHK_IOC_VERSION, 0).context("GHK: GHK_IOC_VERSION")?;
+     if abi != GHK_ABI_VERSION {
+-        bail!("GHK: /dev/ghk speaks ABI {abi}, this crosvm needs {GHK_ABI_VERSION} (load ghk.ko.new)");
++        bail!("GHK: /dev/ghk speaks ABI {abi}, this crosvm needs {GHK_ABI_VERSION} (load ghk.ko.abi3)");
+     }
+ 
+     info!(
+-        "GHK: handing off vm fd {} + {} vcpu fd(s) {:?} (host cpus {:?}), serial {:#x} irq {}, max {} ms{}",
++        "GHK: handing off vm fd {} + {} vcpu fd(s) {:?} (host cpus {:?}), serial {:#x} irq {}, max {} ms, \
++         mmio fwd {}{}",
+         req.vm_fd,
+         n,
+         &req.vcpu_fds[..n],
+@@ -315,6 +369,7 @@
+         SERIAL_BASE,
+         if serial_evt.is_some() { "eventfd" } else { "polled" },
+         max_ms,
++        if mmio_fwd { format!("on ({} ms)", req.mmio_timeout_ms) } else { "off".to_string() },
+         if dry_run { " (dry run)" } else { "" }
+     );
+     let launched = match raw_ioctl(ghk.as_raw_fd(), GHK_IOC_LAUNCH, &req as *const GhkLaunch as u64) {
+@@ -340,12 +395,35 @@
+         }
+     };
+ 
++    let ghk = Arc::new(ghk);
+     let stop = Arc::new(AtomicBool::new(false));
++    // The MMIO server: only for a live launch with the exit channel. It ends on ENOTCONN (after STOP) or on
++    // `stop`; the monitor joins it before releasing anything.
++    let server = if launched && mmio_fwd {
++        let ghk_s = ghk.clone();
++        let stop_s = stop.clone();
++        let bus = mmio_bus;
++        Some(
++            std::thread::Builder::new()
++                .name("ghk_mmio".into())
++                .spawn(move || mmio_server(&ghk_s, bus, n, &stop_s))
++                .context("GHK: spawn mmio server thread")?,
++        )
++    } else {
++        drop(mmio_bus);
++        None
++    };
+     let stop_t = stop.clone();
+     let thread = std::thread::Builder::new()
+         .name("ghk_anchor".into())
+         .spawn(move || {
+             let ev = monitor(&ghk, launched, max_ms, &stop_t);
++            // STOP (in monitor) closed the exit channel: the server sees ENOTCONN within one wait.
++            if let Some(t) = server {
++                if t.join().is_err() {
++                    error!("GHK: mmio server thread panicked");
++                }
++            }
+             // Release order: ghk lets go of the vcpu/VM files (STOP above), then our vcpu objects and the
+             // dup'd VM fd go, then the event wakes run_control, which tears the VM down as usual.
+             drop(ghk);
+@@ -363,6 +441,79 @@
+     Ok(GhkHandoff { stop, thread: Some(thread) })
+ }
+ 
++/// Serve forwarded MMIO exits: one GHK_IOC_MMIO_XFER per access completes the previous answer and fetches the
++/// next request. Mirrors vcpu.rs `VcpuExit::Mmio` (Bus::read zero-fills unmapped reads; at most 32 distinct
++/// unmapped addresses are logged).
++fn mmio_server(ghk: &File, bus: Bus, nr_vcpus: usize, stop: &AtomicBool) {
++    // one Bus clone per vcpu, so BusAccessInfo::id is the vcpu index as in the userspace vcpu threads
++    let buses: Vec<Bus> = (0..nr_vcpus)
++        .map(|i| {
++            let mut b = bus.clone();
++            b.set_access_id(i);
++            b
++        })
++        .collect();
++    drop(bus);
++    let mut unmapped = std::collections::BTreeSet::new();
++    let mut x = GhkMmioXfer { wait_ms: GHK_MMIO_WAIT_MS, ..Default::default() };
++    let (mut served, mut stale) = (0u64, 0u64);
++    info!("GHK: mmio server running ({nr_vcpus} vcpu(s))");
++    loop {
++        if stop.load(Ordering::SeqCst) {
++            break;
++        }
++        match raw_ioctl(ghk.as_raw_fd(), GHK_IOC_MMIO_XFER, &mut x as *mut GhkMmioXfer as u64) {
++            Ok(_) => {}
++            Err(e) => match e.raw_os_error() {
++                Some(libc::ENOTCONN) => break,
++                Some(libc::EINTR) => continue, // nothing consumed: retry the same completion
++                Some(libc::ESTALE) => {
++                    // the vcpu gave up on this request (timeout or stop); drop the answer, keep serving
++                    stale += 1;
++                    warn!("GHK: stale MMIO answer seq {} gpa {:#x}", x.done.seq, x.done.phys_addr);
++                    x.flags = 0;
++                    continue;
++                }
++                _ => {
++                    error!("GHK: GHK_IOC_MMIO_XFER: {e}; mmio server stops (the vcpu will time out)");
++                    break;
++                }
++            },
++        }
++        x.flags = 0;
++        let req = x.next;
++        if req.seq == 0 {
++            continue;
++        }
++        let len = (req.len as usize).min(8);
++        let vcpu = req.vcpu as usize;
++        let mut done = req;
++        if vcpu >= buses.len() || len == 0 {
++            error!("GHK: malformed MMIO request {:?}; answering 0", req);
++            done.data = [0; 8];
++        } else if req.is_write != 0 {
++            if !buses[vcpu].write(req.phys_addr, &req.data[..len])
++                && unmapped.len() < 32
++                && unmapped.insert((req.phys_addr, true))
++            {
++                warn!("MMIO-UNMAPPED: vcpu={} write gpa={:#x} len={} (ghk)", vcpu, req.phys_addr, len);
++            }
++        } else {
++            done.data = [0; 8];
++            if !buses[vcpu].read(req.phys_addr, &mut done.data[..len])
++                && unmapped.len() < 32
++                && unmapped.insert((req.phys_addr, false))
++            {
++                warn!("MMIO-UNMAPPED: vcpu={} read gpa={:#x} len={} (ghk)", vcpu, req.phys_addr, len);
++            }
++        }
++        served += 1;
++        x.done = done;
++        x.flags = GHK_MMIO_COMPLETE;
++    }
++    info!("GHK: mmio server done: {served} access(es) served, {stale} stale");
++}
++
+ fn monitor(ghk: &File, launched: bool, max_ms: u32, stop: &AtomicBool) -> VmEventType {
+     if !launched {
+         return VmEventType::Exit;
+@@ -409,6 +560,9 @@
+         warn!("GHK: the guest did not power off within {max_ms} ms (kernel bound hit)");
+         return VmEventType::Crash;
+     }
++    if st.mmio_fwd_timeouts != 0 {
++        error!("GHK: {} MMIO request(s) were not answered in time; ghk stopped the vcpu", st.mmio_fwd_timeouts);
++    }
+     if st.last_error != 0 || st.vm_status != GH_VM_STATUS_EXITED {
+         return VmEventType::Crash;
+     }
+--- crosvm-ghk-stage3/build-ghk.sh
++++ crosvm-ghk/build-ghk.sh
+@@ -1,13 +1,17 @@
+ #!/bin/bash
+-# Build the stage-3 anchor variant (CROSVM_GHK_HANDOFF) from the COPY ~/vm/src/crosvm-ghk and install it as
+-# ~/vm/bin/crosvm-ghk only. Same features/env as ~/vm/build-crosvm-gpu.sh; never touches crosvm-mmio-gpu.
++# Build the anchor variant (CROSVM_GHK_HANDOFF) from the COPY ~/vm/src/crosvm-ghk and install it as
++# ~/vm/bin/$OUT only (default OUT=crosvm-ghk; stage 4: OUT=crosvm-ghk.abi3). Same features/env as
++# ~/vm/build-crosvm-gpu.sh; never touches crosvm-mmio-gpu.
+ set -u
++OUT=${OUT:-crosvm-ghk}
++case $OUT in crosvm-ghk|crosvm-ghk.*) ;; *) echo "OUT must be crosvm-ghk or crosvm-ghk.<suffix>"; exit 1;; esac
+ export http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890 all_proxy=http://127.0.0.1:7890
+ source $HOME/.cargo/env
+ P=$HOME/vm/opt/virgl; L=$HOME/vm/logs; mkdir -p $L
++LOG=$L/$OUT.log
+ PC=$(dirname $(find $P -name virglrenderer.pc | head -1))
+ cd $HOME/vm/src/crosvm-ghk
+ FEAT=gunyah,audio,audio_aaudio,libaaudio_alsa,balloon,config-file,qcow,net,gpu,usb,vnc,virgl_renderer,media
+-BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/aarch64-linux-gnu CROSVM_USE_SYSTEM_VIRGLRENDERER=1 CROSVM_USE_SYSTEM_MINIGBM=1 PKG_CONFIG_PATH=$PC nice -n 15 ionice -c3 cargo +1.86.0 build --release -j ${JOBS:-2} --no-default-features --features "$FEAT" > $L/crosvm-ghk.log 2>&1
+-rc=$?; echo "rc=$rc" >> $L/crosvm-ghk.log
+-[ $rc = 0 ] && cp target/release/crosvm $HOME/vm/bin/crosvm-ghk.new && mv -f $HOME/vm/bin/crosvm-ghk.new $HOME/vm/bin/crosvm-ghk && echo installed >> $L/crosvm-ghk.log
++BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include/aarch64-linux-gnu CROSVM_USE_SYSTEM_VIRGLRENDERER=1 CROSVM_USE_SYSTEM_MINIGBM=1 PKG_CONFIG_PATH=$PC nice -n 15 ionice -c3 cargo +1.86.0 build --release -j ${JOBS:-2} --no-default-features --features "$FEAT" > $LOG 2>&1
++rc=$?; echo "rc=$rc" >> $LOG
++[ $rc = 0 ] && cp target/release/crosvm $HOME/vm/bin/$OUT.tmp && mv -f $HOME/vm/bin/$OUT.tmp $HOME/vm/bin/$OUT && echo "installed $HOME/vm/bin/$OUT" >> $LOG

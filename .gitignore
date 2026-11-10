@@ -1,0 +1,19 @@
+# Frozen public archive. Keep blobs and secrets out.
+*.img
+*.bin
+*.fd
+*.dtb
+*.sqfs
+*.kc
+*.ipsw
+*.dmg
+*.macho
+*.pem
+*.key
+*.psk
+*thp-calibration*
+__pycache__/
+*.pyc
+.DS_Store
+/private/
+/out/

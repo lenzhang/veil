@@ -1,0 +1,586 @@
+diff --git a/src/drm/msm/msm_renderer.c b/src/drm/msm/msm_renderer.c
+index 8a6e2d8..d0b970e 100644
+--- a/src/drm/msm/msm_renderer.c
++++ b/src/drm/msm/msm_renderer.c
+@@ -5,6 +5,8 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#include <inttypes.h>
++#include <pthread.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -67,6 +69,12 @@ struct msm_context {
+     */
+    struct hash_table *sq_to_ring_idx_table;
+ 
++   /* piano: guest-allocated BOs.  The VMM's dma-buf for the guest-alloc blob whose get_blob() comes next
++    * (set_guest_blob_fd), and the range of the pre-shared arena the shmem ring took. */
++   int pending_guest_fd;
++   bool shmem_arena_backed;
++   uint64_t shmem_arena_offset;
++
+    /**
+     * Indexed by ring_idx-1, which is the same as the submitqueue priority+1.
+     * On the kernel side, there is some drm_sched_entity per {drm_file, prio}
+@@ -106,11 +114,216 @@ gem_close(int fd, uint32_t handle)
+    return drmIoctl(fd, DRM_IOCTL_GEM_CLOSE, &close_req);
+ }
+ 
++/*
++ * piano: the pre-shared host arena (crosvm --pre-alloc drm-host-mb, the FDT's drm2kgsl_host pool), as DroidVM's
++ * drm2kgsl uses it.  A guest whose virtio-gpu maps host blobs only inside that pool (macOS: DroidVMVirtioGpu3D answers
++ * MAP_BLOB with MAP_INFO_POOL + offset) needs the one host blob a context has, its shmem ring, carved from there.
++ * crosvm exports the region as CROSVM_DRM2KGSL_ARENA_* and recognises the resource by its map_ptr in the window.
++ */
++struct msm_arena_extent {
++   uint64_t offset;
++   uint64_t size;
++   struct msm_arena_extent *next;
++};
++
++static struct {
++   pthread_mutex_t lock;
++   bool initialized;
++   bool enabled;
++   int fd;
++   uint64_t fd_offset;
++   uint8_t *host_va;
++   uint64_t size;
++   struct msm_arena_extent *free_list;
++} msm_arena = {
++   .lock = PTHREAD_MUTEX_INITIALIZER,
++   .fd = -1,
++};
++
++static bool
++msm_parse_u64_env(const char *name, uint64_t *value)
++{
++   const char *str = getenv(name);
++   if (!str || !*str)
++      return false;
++
++   char *end = NULL;
++   errno = 0;
++   unsigned long long parsed = strtoull(str, &end, 0);
++   if (errno || !end || *end)
++      return false;
++   *value = parsed;
++   return true;
++}
++
++static bool
++msm_arena_init(void)
++{
++   pthread_mutex_lock(&msm_arena.lock);
++   if (msm_arena.initialized) {
++      bool enabled = msm_arena.enabled;
++      pthread_mutex_unlock(&msm_arena.lock);
++      return enabled;
++   }
++   msm_arena.initialized = true;
++
++   uint64_t fd_value, host_va, size, fd_offset = 0;
++   if (!msm_parse_u64_env("CROSVM_DRM2KGSL_ARENA_FD", &fd_value) ||
++       !msm_parse_u64_env("CROSVM_DRM2KGSL_ARENA_HOST_VA", &host_va) ||
++       !msm_parse_u64_env("CROSVM_DRM2KGSL_ARENA_SIZE", &size) ||
++       fd_value > INT32_MAX || !host_va || !size ||
++       (host_va | size) & (getpagesize() - 1) ||
++       fcntl((int)fd_value, F_GETFD) < 0) {
++      pthread_mutex_unlock(&msm_arena.lock);
++      return false;
++   }
++   msm_parse_u64_env("CROSVM_DRM2KGSL_ARENA_FD_OFFSET", &fd_offset);
++
++   /* Never hand out the first 2 MiB: the Gunyah RM rejects a memparcel whose base is the base of the SHARE window it
++    * lives in (drm2kgsl's base guard). */
++   const uint64_t base_guard = 2ull << 20;
++   struct msm_arena_extent *extent = calloc(1, sizeof(*extent));
++   if ((fd_offset & (getpagesize() - 1)) || size <= base_guard || !extent) {
++      free(extent);
++      pthread_mutex_unlock(&msm_arena.lock);
++      drm_err("unusable arena: fd_offset=0x%" PRIx64 " size=0x%" PRIx64, fd_offset, size);
++      return false;
++   }
++   extent->offset = base_guard;
++   extent->size = size - base_guard;
++   msm_arena.fd = (int)fd_value;
++   msm_arena.fd_offset = fd_offset;
++   msm_arena.host_va = (uint8_t *)(uintptr_t)host_va;
++   msm_arena.size = size;
++   msm_arena.free_list = extent;
++   msm_arena.enabled = true;
++   pthread_mutex_unlock(&msm_arena.lock);
++
++   drm_log("pre-shared arena: fd=%d fd_offset=0x%" PRIx64 " host_va=%p size=0x%" PRIx64,
++           msm_arena.fd, msm_arena.fd_offset, (void *)msm_arena.host_va, msm_arena.size);
++   return true;
++}
++
++static bool
++msm_arena_alloc(uint64_t size, uint64_t *out_offset)
++{
++   size = ALIGN_POT(size, getpagesize());
++
++   pthread_mutex_lock(&msm_arena.lock);
++   struct msm_arena_extent **link = &msm_arena.free_list;
++   while (*link && (*link)->size < size)
++      link = &(*link)->next;
++   if (!*link) {
++      pthread_mutex_unlock(&msm_arena.lock);
++      return false;
++   }
++   struct msm_arena_extent *extent = *link;
++   *out_offset = extent->offset;
++   extent->offset += size;
++   extent->size -= size;
++   if (!extent->size) {
++      *link = extent->next;
++      free(extent);
++   }
++   pthread_mutex_unlock(&msm_arena.lock);
++   return true;
++}
++
++static void
++msm_arena_free(uint64_t offset, uint64_t size)
++{
++   size = ALIGN_POT(size, getpagesize());
++   struct msm_arena_extent *extent = calloc(1, sizeof(*extent));
++   if (!extent) {
++      drm_err("arena range 0x%" PRIx64 "+0x%" PRIx64 " leaked", offset, size);
++      return;
++   }
++   extent->offset = offset;
++   extent->size = size;
++
++   pthread_mutex_lock(&msm_arena.lock);
++   struct msm_arena_extent *prev = NULL, *next = msm_arena.free_list;
++   while (next && next->offset < offset) {
++      prev = next;
++      next = next->next;
++   }
++   extent->next = next;
++   if (prev)
++      prev->next = extent;
++   else
++      msm_arena.free_list = extent;
++   if (next && extent->offset + extent->size == next->offset) {
++      extent->size += next->size;
++      extent->next = next->next;
++      free(next);
++   }
++   if (prev && prev->offset + prev->size == extent->offset) {
++      prev->size += extent->size;
++      prev->next = extent->next;
++      free(extent);
++   }
++   pthread_mutex_unlock(&msm_arena.lock);
++}
++
++/* drm_context_get_shmem_blob() with the ring in the arena instead of a memfd of its own, whose mapping the guest could
++ * not reach.  Host and guest both map the arena cacheable. */
++static int
++msm_get_arena_shmem_blob(struct msm_context *mctx, uint64_t blob_size, uint32_t blob_flags,
++                         struct virgl_context_blob *blob)
++{
++   struct drm_context *dctx = &mctx->base;
++
++   if (blob_flags != VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE) {
++      drm_err("invalid blob_flags: 0x%x", blob_flags);
++      return -EINVAL;
++   }
++   if (dctx->shmem || dctx->blob_size) {
++      drm_err("there can be only one!");
++      return -EINVAL;
++   }
++   if (blob_size < sizeof(*mctx->shmem) || blob_size > UINT32_MAX) {
++      drm_err("invalid blob size 0x%" PRIx64, blob_size);
++      return -EINVAL;
++   }
++
++   uint64_t offset;
++   if (!msm_arena_alloc(blob_size, &offset)) {
++      drm_err("arena exhausted for a shmem blob of 0x%" PRIx64, blob_size);
++      return -ENOMEM;
++   }
++   int fd = os_dupfd_cloexec(msm_arena.fd);
++   if (fd < 0) {
++      msm_arena_free(offset, blob_size);
++      return -ENOMEM;
++   }
++
++   uint8_t *ptr = msm_arena.host_va + offset;
++   memset(ptr, 0, blob_size);   /* ranges are recycled */
++
++   dctx->shmem = (struct vdrm_shmem *)ptr;
++   dctx->shmem->rsp_mem_offset = sizeof(*mctx->shmem);
++   dctx->rsp_mem = ptr + sizeof(*mctx->shmem);
++   dctx->rsp_mem_sz = blob_size - sizeof(*mctx->shmem);
++   dctx->blob_size = blob_size;
++   mctx->shmem_arena_backed = true;
++   mctx->shmem_arena_offset = offset;
++
++   blob->type = VIRGL_RESOURCE_FD_SHM;
++   blob->u.fd = fd;
++   blob->map_ptr = ptr;
++   blob->fd_offset = msm_arena.fd_offset + offset;
++   blob->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
++   return 0;
++}
++
+ struct msm_object {
+    struct drm_object base;
+    uint32_t flags;
+    bool exported   : 1;
+    bool exportable : 1;
++   /* piano: GEM_NEW with MSM_BO_GUEST_ALLOC: no host GEM until get_blob() imports the guest's pages */
++   bool guest_alloc : 1;
++   uint64_t iova;
+    uint8_t *map;
+ };
+ DEFINE_CAST(drm_object, msm_object)
+@@ -311,6 +524,19 @@ msm_renderer_destroy(struct virgl_context *vctx)
+    for (unsigned i = 0; i < nr_timelines; i++)
+       drm_timeline_fini(&mctx->timelines[i]);
+ 
++   /* piano: an arena ring goes back to the arena; drm_context_deinit() would munmap a hole into its mapping */
++   if (mctx->shmem_arena_backed) {
++      msm_arena_free(mctx->shmem_arena_offset, dctx->blob_size);
++      dctx->shmem = NULL;
++      dctx->rsp_mem = NULL;
++      dctx->rsp_mem_sz = 0;
++      dctx->blob_size = 0;
++      mctx->shmem = NULL;
++      mctx->shmem_arena_backed = false;
++   }
++   if (mctx->pending_guest_fd >= 0)
++      close(mctx->pending_guest_fd);
++
+    drm_context_deinit(dctx);
+ 
+    _mesa_hash_table_destroy(mctx->sq_to_ring_idx_table, NULL);
+@@ -380,7 +606,8 @@ msm_renderer_free_object(struct drm_context *dctx, struct drm_object *dobj)
+    if (obj->map)
+       munmap(obj->map, obj->base.size);
+ 
+-   gem_close(dctx->fd, obj->base.handle);
++   if (obj->base.handle)
++      gem_close(dctx->fd, obj->base.handle);
+ 
+    free(obj);
+ }
+@@ -417,6 +644,10 @@ msm_renderer_export_opaque_handle(struct virgl_context *vctx, struct virgl_resou
+    return VIRGL_RESOURCE_FD_DMABUF;
+ }
+ 
++struct msm_context;
++static int msm_set_iova_evicting(struct msm_context *mctx, struct msm_object *self, uint32_t handle, uint64_t iova,
++                                 uint64_t size);
++
+ static int
+ msm_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob_id,
+                       uint64_t blob_size, uint32_t blob_flags,
+@@ -435,8 +666,10 @@ msm_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob
+ 
+    /* blob_id of zero is reserved for the shmem buffer: */
+    if (blob_id == 0) {
+-      int ret = drm_context_get_shmem_blob(dctx, "msm-shmem", sizeof(*mctx->shmem),
+-                                           blob_size, blob_flags, blob);
++      int ret = msm_arena_init()
++         ? msm_get_arena_shmem_blob(mctx, blob_size, blob_flags, blob)
++         : drm_context_get_shmem_blob(dctx, "msm-shmem", sizeof(*mctx->shmem),
++                                      blob_size, blob_flags, blob);
+       if (ret)
+          return ret;
+ 
+@@ -476,6 +709,54 @@ msm_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob
+       return -EINVAL;
+    }
+ 
++   /*
++    * piano: guest-alloc completion.  GEM_NEW left the object empty; its pages are the guest's and reach us as the dma-buf
++    * the VMM built from the blob's iovecs (virgl_renderer_resource_set_guest_blob_fd).  Import it, put it at the iova the
++    * guest chose, and hand the dma-buf on as the resource's: the guest cannot retry with other pages, so fail loudly.
++    */
++   if (obj->guest_alloc) {
++      if (mctx->pending_guest_fd < 0) {
++         drm_err("guest-alloc blob_id=%" PRIu64 " has no dma-buf from the VMM (--gpu udmabuf=true?)", blob_id);
++         return -ENOENT;
++      }
++      int gfd = mctx->pending_guest_fd;
++      mctx->pending_guest_fd = -1;
++      /* the resource keeps it for good: clear of the select()able range (FD_SETSIZE), as export_blob's copy */
++      if (gfd < 1024) {
++         int high = fcntl(gfd, F_DUPFD_CLOEXEC, 1024);
++         if (high >= 0) {
++            close(gfd);
++            gfd = high;
++         }
++      }
++
++      uint32_t handle;
++      if (drmPrimeFDToHandle(dctx->fd, gfd, &handle)) {
++         drm_err("guest-alloc blob_id=%" PRIu64 ": import failed: %s", blob_id, strerror(errno));
++         close(gfd);
++         return -ENOMEM;
++      }
++      if (msm_set_iova_evicting(mctx, obj, handle, obj->iova, obj->base.size)) {
++         drm_err("guest-alloc blob_id=%" PRIu64 ": SET_IOVA 0x%" PRIx64 " failed: %s", blob_id, obj->iova,
++                 strerror(errno));
++         gem_close(dctx->fd, handle);
++         close(gfd);
++         return -EINVAL;
++      }
++      obj->base.handle = handle;
++      drm_context_object_set_res_id(dctx, &obj->base, res_id);
++
++      blob->type = VIRGL_RESOURCE_FD_DMABUF;
++      blob->u.fd = gfd;
++      blob->map_info = (obj->flags & (MSM_BO_CACHED | MSM_BO_CACHED_COHERENT)) ? VIRGL_RENDERER_MAP_CACHE_CACHED
++                                                                              : VIRGL_RENDERER_MAP_CACHE_WC;
++      obj->exported = true;
++      obj->exportable = !!(blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE);
++      drm_dbg("guest-alloc blob_id=%" PRIu64 " res_id=%u handle=%u iova=0x%" PRIx64, blob_id, res_id, handle,
++              obj->iova);
++      return 0;
++   }
++
+    drm_context_object_set_res_id(dctx, &obj->base, res_id);
+ 
+    if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_SHAREABLE) {
+@@ -506,6 +787,51 @@ msm_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob
+    return 0;
+ }
+ 
++/* piano: park the VMM's dma-buf for the guest-alloc blob whose get_blob() comes next */
++static int
++msm_renderer_set_guest_blob_fd(struct virgl_context *vctx, uint64_t blob_id, int fd)
++{
++   struct msm_context *mctx = to_msm_context(to_drm_context(vctx));
++
++   if (mctx->pending_guest_fd >= 0) {
++      drm_err("guest blob fd already pending (blob_id=%" PRIu64 "); dropping the stale one", blob_id);
++      close(mctx->pending_guest_fd);
++   }
++   mctx->pending_guest_fd = fd;
++   return 0;
++}
++
++/* piano: set an iova, evicting what still holds the range: objects the guest already freed whose unref its kernel deferred
++ * (KGSL lets a bind replace a stale range; msm answers -ENOSPC). Their iovas are cleared, they leave the submit tables. */
++static int
++msm_set_iova_evicting(struct msm_context *mctx, struct msm_object *self, uint32_t handle, uint64_t iova, uint64_t size)
++{
++   uint64_t value = iova;
++   int ret = gem_info(mctx, handle, MSM_INFO_SET_IOVA, &value);
++   if (ret != -ENOSPC)
++      return ret;
++
++   unsigned evicted = 0;
++   const uint64_t end = iova + ALIGN_POT(size, getpagesize());
++   hash_table_foreach (mctx->base.resource_table, entry) {
++      struct msm_object *other = to_msm_object((struct drm_object *)entry->data);
++      if (other == self || !other->iova || !other->base.handle)
++         continue;
++      const uint64_t other_end = other->iova + ALIGN_POT(other->base.size, getpagesize());
++      if (other->iova < end && iova < other_end) {
++         uint64_t zero = 0;
++         if (!gem_info(mctx, other->base.handle, MSM_INFO_SET_IOVA, &zero)) {
++            other->iova = 0;
++            evicted++;
++         }
++      }
++   }
++   value = iova;
++   ret = gem_info(mctx, handle, MSM_INFO_SET_IOVA, &value);
++   drm_dbg("iova 0x%" PRIx64 "+0x%" PRIx64 ": %u stale object(s) evicted, ret %d", iova, size, evicted, ret);
++   return ret;
++}
++
+ static void *
+ msm_context_rsp(struct msm_context *mctx, const struct vdrm_ccmd_req *hdr, size_t len)
+ {
+@@ -566,8 +892,33 @@ msm_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+    char payload[payload_len];
+    memcpy(payload, req->payload, payload_len);
+ 
++   /* piano: the macOS guest asks drm2kgsl for a deadline queue (0x80000000, beyond msm's flags, which msm refuses) */
++   if (iocnr == DRM_MSM_SUBMITQUEUE_NEW)
++      ((struct drm_msm_submitqueue *)(void *)payload)->flags &= ~0x80000000u;
++
++   /* piano: the guest's queues all go to the host's ring 0 (MSM_GUEST_QUEUE_PRIO, default 2: ring 0, its lowest scheduling
++    * priority), where the desktop's compositor submits too (Mesa's default priority 1). On a lower ring, a compositor frame
++    * preempted the guest mid-job; a full-panel 3200x2136 pass did not reach a preemption point in time ("preemption timed out",
++    * the guest's context recovered away, the VM's display died under GNOME). The guest's own priority stays its ring index
++    * (sq_to_ring_idx_table, fences), only the kernel sees the override. MSM_GUEST_QUEUE_PRIO=-1 keeps the guest's. */
++   uint32_t guest_prio = 0;
++   if (iocnr == DRM_MSM_SUBMITQUEUE_NEW) {
++      struct drm_msm_submitqueue *sq = (void *)payload;
++      const char *env = getenv("MSM_GUEST_QUEUE_PRIO");
++      const int forced = env ? atoi(env) : 2;
++      guest_prio = sq->prio;
++      if (forced >= 0)
++         sq->prio = (uint32_t)forced;
++   }
++
+    rsp->ret = drmIoctl(dctx->fd, req->cmd, payload);
+ 
++   if (iocnr == DRM_MSM_SUBMITQUEUE_NEW) {
++      drm_log("guest submitqueue prio %u -> host prio %u (ret %d)", guest_prio,
++              ((struct drm_msm_submitqueue *)(void *)payload)->prio, rsp->ret);
++      ((struct drm_msm_submitqueue *)(void *)payload)->prio = guest_prio;
++   }
++
+    if (req->cmd & IOC_OUT)
+       memcpy(rsp->payload, payload, payload_len);
+ 
+@@ -596,6 +947,22 @@ msm_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+       goto out_error;
+    }
+ 
++   /* piano: a guest-allocated BO: the guest owns the pages and picked the iova; get_blob() finishes the object once the
++    * VMM's dma-buf of those pages arrives. */
++   if (req->flags & MSM_BO_GUEST_ALLOC) {
++      struct msm_object *gobj = msm_object_create(0, req->flags & ~MSM_BO_GUEST_ALLOC, req->size);
++      if (!gobj) {
++         ret = -ENOMEM;
++         goto out_error;
++      }
++      gobj->guest_alloc = true;
++      gobj->iova = req->iova;
++      drm_context_object_set_blob_id(dctx, &gobj->base, req->blob_id);
++      drm_dbg("guest-alloc obj=%p blob_id=%u iova=0x%" PRIx64 " size=0x%" PRIx64, (void *)gobj, req->blob_id,
++              req->iova, (uint64_t)req->size);
++      return 0;
++   }
++
+    /*
+     * First part, allocate the GEM bo:
+     */
+@@ -630,6 +997,7 @@ msm_ccmd_gem_new(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+       ret = -ENOMEM;
+       goto out_close;
+    }
++   obj->iova = iova;
+ 
+    drm_context_object_set_blob_id(dctx, &obj->base, req->blob_id);
+ 
+@@ -663,7 +1031,7 @@ msm_ccmd_gem_set_iova(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+    uint64_t iova = req->iova;
+    if (iova) {
+       TRACE_SCOPE("SET_IOVA");
+-      ret = gem_info(mctx, obj->base.handle, MSM_INFO_SET_IOVA, &iova);
++      ret = msm_set_iova_evicting(mctx, obj, obj->base.handle, iova, obj->base.size);
+    } else {
+       TRACE_SCOPE("CLEAR_IOVA");
+       ret = gem_info(mctx, obj->base.handle, MSM_INFO_SET_IOVA, &iova);
+@@ -675,6 +1043,7 @@ msm_ccmd_gem_set_iova(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+ 
+    drm_dbg("obj=%p, blob_id=%u, handle=%u, iova=%" PRIx64, (void*)obj, obj->base.blob_id,
+            obj->base.handle, iova);
++   obj->iova = req->iova;
+ 
+    return 0;
+ 
+@@ -733,7 +1102,7 @@ msm_ccmd_gem_set_name(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+ static void
+ msm_dump_submit(struct drm_msm_gem_submit *req)
+ {
+-#ifndef NDEBUG
++#if 1 /* piano: also in release builds, the one place a failed submit says what it was */
+    drm_log("  flags=0x%x, queueid=%u", req->flags, req->queueid);
+    for (unsigned i = 0; i < req->nr_bos; i++) {
+       struct drm_msm_gem_submit_bo *bos = U642VOID(req->bos);
+@@ -770,35 +1139,54 @@ msm_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+       return -ENOSPC;
+    }
+ 
+-   const unsigned bo_limit = 8192 / sizeof(struct drm_msm_gem_submit_bo);
+-   bool bos_on_stack = req->nr_bos < bo_limit;
+-   struct drm_msm_gem_submit_bo _bos[bos_on_stack ? req->nr_bos : 0];
+-   struct drm_msm_gem_submit_bo *bos;
+-
+-   if (bos_on_stack) {
+-      bos = _bos;
+-   } else {
+-      bos = malloc(req->nr_bos * sizeof(bos[0]));
+-      if (!bos)
+-         return -ENOMEM;
+-   }
++   /* piano: room for every object of the context after the guest's own table (see below) */
++   const uint32_t nr_objects = dctx->resource_table->entries;
++   const bool bos_on_stack = false;
++   struct drm_msm_gem_submit_bo *bos = malloc((req->nr_bos + nr_objects) * sizeof(bos[0]));
++   if (!bos)
++      return -ENOMEM;
+ 
+    memcpy(bos, req->payload, req->nr_bos * sizeof(bos[0]));
+ 
+    for (uint32_t i = 0; i < req->nr_bos; i++)
+       bos[i].handle = handle_from_res_id(mctx, bos[i].handle);
+ 
++   /* piano: a legacy (non-VM_BIND) msm context maps a BO into the GPU's pagetables only while a submit that lists it pins it;
++    * SET_IOVA only reserves the range.  The macOS guest lists just its command buffers (KGSL binds BOs for good), so append
++    * every object that has an iova here, once, without implicit sync (the guest orders its work itself). */
++   uint32_t nr_bos = req->nr_bos;
++   hash_table_foreach (dctx->resource_table, entry) {
++      struct msm_object *obj = to_msm_object((struct drm_object *)entry->data);
++      if (!obj->base.handle || !obj->iova)
++         continue;
++      bool listed = false;
++      for (uint32_t i = 0; i < req->nr_bos && !listed; i++)
++         listed = bos[i].handle == obj->base.handle;
++      if (listed)
++         continue;
++      bos[nr_bos++] = (struct drm_msm_gem_submit_bo){
++         .flags = MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE | MSM_SUBMIT_BO_NO_IMPLICIT,
++         .handle = obj->base.handle,
++         .presumed = obj->iova,
++      };
++   }
++
+    uint32_t fence_flags = MSM_SUBMIT_FENCE_FD_OUT | MSM_SUBMIT_FENCE_SN_IN;
+ 
+-   int in_fence_fd = virgl_context_take_in_fence_fd(&dctx->base);
++   int in_fence_fd = -1; /* piano: this fork has no virgl_context_take_in_fence_fd (no guest in-fences) */
+    if (in_fence_fd >= 0)
+          fence_flags |= MSM_SUBMIT_FENCE_FD_IN;
+ 
++   /* piano: the macOS guest (drm2kgsl's protocol) names no pipe; msm refuses a submit without MSM_PIPE_3D0 */
++   uint32_t submit_flags = req->flags;
++   if (!MSM_PIPE_ID(submit_flags))
++      submit_flags |= MSM_PIPE_3D0;
++
+    struct drm_msm_gem_submit args = {
+-      .flags = req->flags | fence_flags,
++      .flags = submit_flags | fence_flags,
+       .fence = req->fence,
+       .fence_fd = in_fence_fd,
+-      .nr_bos = req->nr_bos,
++      .nr_bos = nr_bos,
+       .nr_cmds = req->nr_cmds,
+       .bos = VOID2U64(bos),
+       .cmds = VOID2U64(&req->payload[req->nr_bos * sizeof(struct drm_msm_gem_submit_bo)]),
+@@ -815,7 +1203,7 @@ msm_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+          mctx->shmem->async_error++;
+    } else {
+       const struct hash_entry *entry =
+-            hash_table_search(mctx->sq_to_ring_idx_table, args.queueid);
++            _mesa_hash_table_search(mctx->sq_to_ring_idx_table, (void *)(uintptr_t)args.queueid); /* piano: fork util API */
+ 
+       if (!entry) {
+          drm_err("unknown submitqueue: %u", args.queueid);
+@@ -1072,8 +1460,10 @@ msm_renderer_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_na
+    mctx->base.base.attach_resource = msm_renderer_attach_resource;
+    mctx->base.base.export_opaque_handle = msm_renderer_export_opaque_handle;
+    mctx->base.base.get_blob = msm_renderer_get_blob;
++   mctx->base.base.set_guest_blob_fd = msm_renderer_set_guest_blob_fd;
++   mctx->pending_guest_fd = -1;
+    mctx->base.base.submit_fence = msm_renderer_submit_fence;
+-   mctx->base.base.supports_fence_sharing = true;
++   /* piano: no supports_fence_sharing in this fork */
+    mctx->base.free_object = msm_renderer_free_object;
+ 
+    /* Only 4 byte alignment is required for legacy reasons. */

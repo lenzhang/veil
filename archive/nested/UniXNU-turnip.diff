@@ -1,0 +1,69 @@
+Submodule drivers/AdrenoMetal contains modified content
+diff --git a/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm b/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+index 3274657..d529cb0 100644
+--- a/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
++++ b/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+@@ -42,7 +42,6 @@
+ #include <signal.h>
+ #include <stdlib.h>
+ #include <string.h>
+-#include <unistd.h>
+ #include <sys/stat.h>
+ #include "bridge/NativeMetalObjects.h"
+ #include "NativeBridgeMetalFrontend.h"
+@@ -2751,8 +2750,34 @@ static void writeDrawStats() {
+ 
+ @interface NBRenderEncoder : NBEncoder
+ @property(nonatomic) uint64_t passKey;   // colour 0 format | load << 16 | surface << 18 | big << 19
++@property(nonatomic) uint64_t passPixels;   // colour attachment 0's pixels
+ @end
++// Render-pass barriers off while /Library/Preferences/com.droidvm.nmb-no-render-barrier exists (read once per process; a process
++// whose sandbox cannot see the file keeps them on): the A/B switch for them without restaging the plugin.
++// And never in a pass whose colour target is a panel-sized IOSurface: a barrier there (the bridge splits the pass) locked the Adreno up at
++// every 3200x2136 login (msm hangcheck, offending task v_gpu; none with barriers off, none at 1600x1068). RenderBox's coverage
++// read-backs are in offscreen targets (icons, glyphs, their atlases -- some larger than 4 Mpx: all blank when every big pass
++// lost its barriers), which keep them.
++static constexpr uint64_t kBarrierMaxPassPixels = 4000000;
++static bool nbRenderBarriers() {
++ static int on = -1;
++ if (on < 0) on = access("/Library/Preferences/com.droidvm.nmb-no-render-barrier", F_OK) != 0;
++ return on;
++}
+ @implementation NBRenderEncoder
++// A panel-sized pass into an IOSurface (WindowServer's and the windows' framebuffers): no barrier there (see kBarrierMaxPassPixels).
++- (BOOL)barrierUnsafePass {return self.passPixels > kBarrierMaxPassPixels && (self.passKey >> 18 & 1);}
++// Render-pass memory barriers (the bridge splits the pass): RenderBox reads back, in the same encoder, the coverage an earlier draw
++// accumulated in a render target; dropped, SwiftUI glyphs and IconRendering icons drew as blocks or nothing (piano, 2026-11-10).
++- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {
++ if (!nbRenderBarriers() || [self barrierUnsafePass]) return;
++ ENCODE([self check:nmb_render_memory_barrier(self.handle,scope,after,before) what:"render memory barrier"]);
++}
++- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {
++ (void)resources;(void)count;
++ if (!nbRenderBarriers() || [self barrierUnsafePass]) return;
++ ENCODE([self check:nmb_render_memory_barrier(self.handle,MTLBarrierScopeBuffers|MTLBarrierScopeTextures|MTLBarrierScopeRenderTargets,after,before) what:"render memory barrier"]);
++}
+ - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
+  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+  if(dumpDescribes())self.dumpPipeline=state;
+@@ -3471,6 +3496,7 @@ static void noteSampleBuffers(id attachments,const char *what) {
+  if(made) {
+   id<MTLTexture> t0=d.colorAttachments[0].texture;
+   const uint64_t big=t0 && (uint64_t)t0.width*t0.height>=2000000;
++  ((NBRenderEncoder *)made).passPixels=t0?(uint64_t)t0.width*t0.height:0;
+   ((NBRenderEncoder *)made).passKey=(t0?(uint64_t)t0.pixelFormat:0)|((uint64_t)d.colorAttachments[0].loadAction<<16)|
+    (uint64_t)([(id)t0 isKindOfClass:[NBTexture class]] && ((NBTexture *)t0).surface?1:0)<<18|big<<19;
+  }
+diff --git a/drivers/AdrenoMetal/bridge/NativeMetalObjects.h b/drivers/AdrenoMetal/bridge/NativeMetalObjects.h
+index fc01785..b7d9d04 100644
+--- a/drivers/AdrenoMetal/bridge/NativeMetalObjects.h
++++ b/drivers/AdrenoMetal/bridge/NativeMetalObjects.h
+@@ -357,6 +357,8 @@ bool nmb_render_set_stencil_reference(NmbEncoder *, uint32_t front, uint32_t bac
+ bool nmb_render_set_blend_color(NmbEncoder *, const float color[4]);
+ bool nmb_render_set_depth_bias(NmbEncoder *, float bias, float slope_scale, float clamp);
+ bool nmb_render_set_line_width(NmbEncoder *, float width);
++/* scope: MTLBarrierScope, after/before: MTLRenderStages */
++bool nmb_render_memory_barrier(NmbEncoder *, uint64_t scope, uint64_t after, uint64_t before);
+ bool nmb_render_set_visibility_mode(NmbEncoder *, uint64_t mode, uint64_t offset);
+ bool nmb_render_draw(NmbEncoder *, uint64_t primitive, uint32_t start, uint32_t count, uint32_t instances, uint32_t base_instance);
+ /* NULL indices: drawPrimitives:indirectBuffer:; otherwise the indexed indirect draw. */

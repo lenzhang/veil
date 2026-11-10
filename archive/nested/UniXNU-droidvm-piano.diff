@@ -1,0 +1,42 @@
+diff --git a/board.toml b/board.toml
+index 9bc5aa2..1422750 100644
+--- a/board.toml
++++ b/board.toml
+@@ -99,7 +99,7 @@ roots = [
+ volume = "DROIDVMESP"
+ size_mib = 192
+ loader = "driver"
+-title = "DroidVM: iPadOS 17.7.11, CPU-rendered desktop"
++title = "DroidVM on piano (Ubuntu host): iPadOS 17.7.11, CPU-rendered"
+ dram_size = "0x13f600000"            # guest RAM of the 5120 MiB pseudo-unprotected VM: "SHIM: /memory now 0x80600000+0x13f600000"
+ skip_setup_tool = "scripts/seed-data-skip-setup.py"
+ # The original static/System trust caches, and the owner trust bundle built around them with the Adreno Metal plugin's CDHashes
+@@ -150,16 +150,16 @@ kernel_args = [
+   "droidvm-disable-jobs=com.apple.watchdogd,com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd",
+   # the host phone's GPU through crosvm --droidvm-gpu (kits/droidvm/DroidVMGpu.cpp): NativeAdreno's service over KGSL, after one
+   # CP_MEM_WRITE through it
+-  "droidvm-gpu=1",
+-  "droidvm-gpu-selftest=1",
++  # piano: dropped "droidvm-gpu=1",
++  # piano: dropped "droidvm-gpu-selftest=1",
+   # the AGXAccelerator for the original Metal discovery, and the plugin bundle (staged in the Data seed by add-gpu-plugin-data.py)
+   # mounted over /System/Library/Extensions
+-  "droidvm-gpu-metal=1",
+-  "sheng-gpu-addon=1",
++  # piano: dropped "droidvm-gpu-metal=1",
++  # piano: dropped "sheng-gpu-addon=1",
+   # the processes besides backboardd that get a Metal device of their own (DroidVMLaunchPolicy.c writes the plugin's clients file):
+   # WidgetRenderer draws the widgets through RenderBox, PosterBoard the wallpaper, and iconservicesagent the app icons, whose
+   # CoreImage context otherwise falls back to OpenGL ES and crashes in CI::GLContext on every icon (sheng disables the job)
+-  "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard,iconservicesagent",
++  # piano: dropped "droidvm-gpu-clients=WidgetRenderer_Default,PosterBoard,iconservicesagent",
+ ]
+ 
+ [payload.adt]
+@@ -178,5 +178,4 @@ chip_id = "8011"                     # iPad7,1 (A10X), as board [ipsw] chip_id
+ # The third crosvm --virtio-mmio-block (tools/rig/make-data-store.sh) is the store disk, not a NativeVirtioBlock image;
+ # --virtio-mmio-input puts the app's four input devices (mouse, multi-touch, absolute mouse, keyboard) after the disks, and
+ # --droidvm-gpu its GPU after them.
+-tool_args = ["--data-store-mmio", "0x0a002000", "--input-mmio", "0x0a003000,0x0a004000,0x0a005000,0x0a006000",
+-             "--gpu-mmio", "0x0a007000", "--reclaim-memory"]
++tool_args = ["--fdt", "${PIANO_WORKTREE}/droidvm-build/piano/crosvm-piano-5120m-4cpu.dtb", "--data-store-mmio", "0x0a002000", "--reclaim-memory"]

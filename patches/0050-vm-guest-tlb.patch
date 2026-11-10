@@ -1,0 +1,79 @@
+From 7354e15d5c8f027fee43a69031c0e7dbb8e63ca5 Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Mon, 9 Nov 2026 21:06:04 +0800
+Subject: [PATCH] k27: VM-guest TLB safety: 16-bit ASIDs and non-global
+ shared-region mappings (XNU_VM_GUEST_TLB)
+
+Gunyah does not flush a CPU's TLB when another vCPU of the VM runs there. With 8-bit ASIDs
+XNU multiplexes address spaces onto one ASID and keeps them apart with per-CPU bookkeeping
+and core-local flushes; after a vCPU migration processes read each other's pages (launchd
+exited reading sort's _pthread_count). Shared-region mappings were global and also only
+flushed core-locally. BCM2837.h now defines XNU_VM_GUEST_TLB (default 1): HAS_16BIT_ASID
+(unique ASID per address space, broadcast-flushed before reuse) and nG shared-region PTEs.
+asidtest with forced migrations: 0 cross-address-space reads (8-bit kernel: several in 45 s).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ osfmk/arm/pmap/pmap.c           |  6 ++++++
+ osfmk/arm64/cpu.c               |  2 ++
+ pexpert/pexpert/arm64/BCM2837.h | 12 ++++++++++++
+ 3 files changed, 20 insertions(+)
+
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 79d0bc1..609b521 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6162,6 +6162,12 @@ pmap_construct_pte(
+ 	} else {
+ 		if (pmap->type != PMAP_TYPE_NESTED) {
+ 			pte |= ARM_PTE_NG;
++#if XNU_VM_GUEST_TLB
++		} else if (true) {
++			/* Shared-region entries tagged with the ASID of the address space that walked them (BCM2837.h): a global one
++			 * outlives the core-local flush pmap_switch() gives it on a vCPU that has moved to another physical CPU. */
++			pte |= ARM_PTE_NG;
++#endif
+ 		} else if ((pmap->nested_region_unnested_table_bitmap)
+ 		    && (va >= pmap->nested_region_addr)
+ 		    && (va < (pmap->nested_region_addr + pmap->nested_region_size))) {
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index d10d7a1..04ecbbc 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -882,8 +882,10 @@ cpu_data_init(cpu_data_t *cpu_data_ptr)
+ 	pmap_cpu_data_ptr->pv_free_spill_marker = NULL;
+ #if !CONFIG_SPTM
+ 	pmap_cpu_data_ptr->cpu_nested_pmap = (struct pmap *) NULL;
++#if !HAS_16BIT_ASID   /* XNU_VM_GUEST_TLB (BCM2837.h): no per-CPU alias bookkeeping with 16-bit ASIDs */
+ 	bzero(&(pmap_cpu_data_ptr->cpu_sw_asids[0]), sizeof(pmap_cpu_data_ptr->cpu_sw_asids));
+ #endif
++#endif
+ #endif /* !XNU_MONITOR */
+ 	cpu_data_ptr->halt_status = CPU_NOT_HALTED;
+ #if __ARM_KERNEL_PROTECT__
+diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
+index 0d7e976..e6e180a 100644
+--- a/pexpert/pexpert/arm64/BCM2837.h
++++ b/pexpert/pexpert/arm64/BCM2837.h
+@@ -15,6 +15,18 @@
+ #define HAS_APPLE_PAC 1
+ #endif
+ #define BCM2837_BRINGUP
++
++/* XNU_VM_GUEST_TLB (k27/build-kernel27.sh): a guest of a hypervisor that does not flush a CPU's TLB when another vCPU of the VM
++ * comes to run there (Gunyah on the piano: the vCPUs are host threads the host migrates). No correctness may rest on core-local
++ * TLB invalidation then: 16-bit ASIDs, one per address space and broadcast-flushed before reuse (with 8-bit ones address spaces
++ * share an ASID, told apart by per-CPU bookkeeping and core-local flushes: processes read each other's pages after a migration),
++ * and non-global shared-region mappings (pmap.c), whose global entries were also only flushed core-locally. */
++#ifndef XNU_VM_GUEST_TLB
++#define XNU_VM_GUEST_TLB 1   /* the piano's k27 is only ever such a guest; here, so assembly (TCR_EL1.AS) agrees with C */
++#endif
++#if XNU_VM_GUEST_TLB
++#define HAS_16BIT_ASID 1
++#endif
+ #define ARM_ARCH_TIMER
+ 
+ #define __ARM_ARCH__              8
+-- 
+2.55.0
+

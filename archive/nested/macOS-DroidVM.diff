@@ -1,0 +1,164 @@
+diff --git a/configs/kc-keep.txt b/configs/kc-keep.txt
+index ca9d022..625aaa3 100644
+--- a/configs/kc-keep.txt
++++ b/configs/kc-keep.txt
+@@ -13,3 +13,4 @@ com.apple.plugin.IOgPTPPlugin
+ com.apple.driver.AppleDiskImages2
+ com.apple.filesystems.hfs.kext
+ com.apple.driver.AppleMultitouchDriver
++ com.apple.driver.driverkit.serial
+diff --git a/k27/segaddrs.json b/k27/segaddrs.json
+index c7a4698..7840265 100644
+--- a/k27/segaddrs.json
++++ b/k27/segaddrs.json
+@@ -1 +1 @@
+-{"DATA_CONST_START": 8486912, "DATA_START": 61292544}
++{"DATA_CONST_START": 8454144, "DATA_START": 61161472}
+diff --git a/k27/segaddrs.sh b/k27/segaddrs.sh
+index 61a87b6..d70abe2 100755
+--- a/k27/segaddrs.sh
++++ b/k27/segaddrs.sh
+@@ -3,7 +3,7 @@ KB=0xfffffff007004000
+ echo -n "-Wl,-rename_section,__TEXT,__cstring,__TEXT_EXEC,__cstring "
+ a() { printf -- "-Wl,-segaddr,%s,0x%x " "$1" $((KB + $2)); }
+ {
+-a __TEXT 0x4000; a __DATA_CONST 0x818000; a __LASTDATA_CONST 0x9f8000; a __TEXT_EXEC 0x2df0000; a __KLD 0x3854000; a __LAST 0x3860000; a __KLDDATA 0x3a74000; a __DATA 0x3a7c000; a __BOOTDATA 0x3be0000; a __PRELINK_TEXT 0x3864000;
+-o=0x3cc4000; for n in __PRELINK_DATA __PRELINK_INFO __PLK_TEXT_EXEC __PLK_DATA_CONST __PLK_LLVM_COV __PLK_LINKEDIT; do a $n $o; o=$((o+0x4000)); done
+-a __LINKINFO 0x3e20000
++a __TEXT 0x4000; a __DATA_CONST 0x810000; a __LASTDATA_CONST 0x9f0000; a __TEXT_EXEC 0x2d6c000; a __KLD 0x3834000; a __LAST 0x3840000; a __KLDDATA 0x3a54000; a __DATA 0x3a5c000; a __BOOTDATA 0x3bc0000; a __PRELINK_TEXT 0x3844000;
++o=0x3ca4000; for n in __PRELINK_DATA __PRELINK_INFO __PLK_TEXT_EXEC __PLK_DATA_CONST __PLK_LLVM_COV __PLK_LINKEDIT; do a $n $o; o=$((o+0x4000)); done
++a __LINKINFO 0x3e00000
+ } | sed 's/ $//'
+diff --git a/overlay/kext/DroidVMDisplay/DroidVMDisplay.cpp b/overlay/kext/DroidVMDisplay/DroidVMDisplay.cpp
+index 0cf57ca..5e9eb39 100644
+--- a/overlay/kext/DroidVMDisplay/DroidVMDisplay.cpp
++++ b/overlay/kext/DroidVMDisplay/DroidVMDisplay.cpp
+@@ -116,8 +116,10 @@ extern "C" bool droidvm_virtgpu_finished(uint64_t);
+ 
+ class VirtioGpu {
+ public:
+-    static constexpr uint32_t kRequestBytes = DroidVMVirtioGpu::MaxCommand;   // a blob's page list: 8 K entries
+-    static constexpr uint32_t kMaxEntries = (kRequestBytes - 64) / sizeof(VirtioGpuEntry);
++    // A blob's page list: the transport's MaxEntries (64 MiB of scattered 4 KiB pages; past MaxCommand it goes through its huge
++    // request buffer). It was MaxCommand's 8 K entries: a 3200x2136 half-float surface (54.7 MB, ~13.4 K pages) never got a
++    // scanout resource, eight failures switched the display to copying, and the screen stayed black.
++    static constexpr uint32_t kMaxEntries = DroidVMVirtioGpu::MaxEntries;
+     const char *start() {return DroidVMVirtioGpu::start() ? nullptr : "the transport did not start (see virtio-gpu: lines)";}
+     bool ready() const {return DroidVMVirtioGpu::ready();}
+     uint64_t features() const {return DroidVMVirtioGpu::features();}
+@@ -201,7 +203,9 @@ private:
+     // The refresh rate of the timing published (boot-arg droidvm-display-hz, 30 to 240): the app's window shows 120 Hz (its gpu-0
+     // screen's refresh rate).
+     uint32_t fRefreshHz;
+-    static constexpr uint32_t kWidthMM = 286, kHeightMM = 179;   // a 13.3-inch 16:10 panel: about 114 dpi at 1280x800
++    // The panel's physical size (boot-arg droidvm-display-mm=WIDTHxHEIGHT in mm; default a 13.3-inch 16:10 panel, about 114 dpi
++    // at 1280x800). macOS offers HiDPI ("looks like" half the pixels) modes by the pixel density these give.
++    uint32_t kWidthMM = 286, kHeightMM = 179;
+     static constexpr uint32_t kColorID = 100, kTimingID = 1000;  // AppleParavirtDisplay's IDs of its first color and timing element
+ 
+     bool clean_queue_gated();
+@@ -320,6 +324,16 @@ bool DroidVMDisplay::start(IOService *provider)
+ {
+     fRefreshHz = 120;
+     PE_parse_boot_argn("droidvm-display-hz", &fRefreshHz, sizeof(fRefreshHz));
++    {
++        char mm[32] = {};
++        if (PE_parse_boot_arg_str("droidvm-display-mm", mm, sizeof(mm))) {
++            uint32_t w = 0, h = 0;
++            const char *c = mm;
++            while (*c >= '0' && *c <= '9') w = w * 10 + uint32_t(*c++ - '0');
++            if (*c == 'x') for (++c; *c >= '0' && *c <= '9';) h = h * 10 + uint32_t(*c++ - '0');
++            if (w >= 50 && w <= 2000 && h >= 50 && h <= 2000) { kWidthMM = w; kHeightMM = h; }
++        }
++    }
+     if (fRefreshHz < 30 || fRefreshHz > 240)
+         fRefreshHz = 120;
+     if (getPlatform()->getConsoleInfo(&fVideo) != kIOReturnSuccess || !fVideo.v_baseAddr || fVideo.v_depth != 32) {
+@@ -1135,8 +1149,10 @@ bool DroidVMDisplay::createDisplayAttributes()
+         if (!colors->setObject(color) || !timingColors->setObject(color) || !timings->setObject(timing))
+             break;
+         ioavTimingSetColorElements(timing, timingColors);
++        // The serial number is the size: WindowServer keeps the chosen mode per display identity, so each boot disk screen size
++        // (1600x1068 at 1x, the panel's 3200x2136 at 2x) gets its own saved choice instead of inheriting the other's.
+         if (!(appendString(product, "ManufacturerID", "APP") && appendNumber(product, "ProductID", 0) &&
+-              appendNumber(product, "SerialNumber", 0) && appendString(product, "ProductName", "DroidVM Display") &&
++              appendNumber(product, "SerialNumber", width << 16 | height) &&appendString(product, "ProductName", "DroidVM Display") &&
+               appendNumber(product, "WeekOfManufacture", 24) && appendNumber(product, "YearOfManufacture", 2021)))
+             break;
+         if (!(appendDictionary(chromaticity, "Red", point(41943, 21627)) && appendDictionary(chromaticity, "Green", point(19661, 39322)) &&
+diff --git a/overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h b/overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h
+index 435da35..30b2af8 100644
+--- a/overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h
++++ b/overlay/kext/DroidVMDisplay/IOMobileFramebufferABI.h
+@@ -361,8 +361,8 @@ public:
+     virtual IOReturn trigger_pswap_dependent_thread();                                                                             // 480 0x106a
+     virtual IOReturn send_clamshell_state();                                                                                       // 481 0xf761
+     virtual IOReturn get_shared_disp_property();                                                                                   // 482 0xc09c
+-    uint8_t iomfbLegacyState[0x1de0 - sizeof(IOService)];   // the instance size of its MetaClass
++    uint8_t iomfbLegacyState[0x1dd8 - sizeof(IOService)];   // the instance size of its MetaClass
+ };
+ 
+-static_assert(sizeof(IOMobileFramebufferLegacy) == 0x1de0, "IOMobileFramebufferLegacy instance size");
++static_assert(sizeof(IOMobileFramebufferLegacy) == 0x1dd8, "IOMobileFramebufferLegacy instance size");
+ enum : unsigned {IOMobileFramebufferLegacySlots = 483};
+diff --git a/overlay/metal/NativeAdrenoMetalPlugin.mm b/overlay/metal/NativeAdrenoMetalPlugin.mm
+index 17b0344..88f09f0 100644
+--- a/overlay/metal/NativeAdrenoMetalPlugin.mm
++++ b/overlay/metal/NativeAdrenoMetalPlugin.mm
+@@ -344,25 +344,43 @@ static id deviceForPort(io_service_t port)
+         setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+-        // The runtime needs a writable shader-cache directory: the user cache directory, the process's own folder in it (a platform
+-        // sandbox lets a service write only there), the temp directory, else /private/var/tmp.
+-        char candidates[4][512] = {};
+-        if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16))
+-            candidates[0][0] = 0;
+-        if (NSString *bundle = NSBundle.mainBundle.bundleIdentifier; candidates[0][0] && bundle.length) {
+-            snprintf(candidates[1], sizeof candidates[1] - 16, "%s%s/", candidates[0], bundle.UTF8String);
+-            mkdir(candidates[1], 0700);
++        // The runtime needs a writable shader-cache directory. First where Metal itself keeps one, the user cache directory's
++        // com.apple.metal/<bundle or program> -- every system sandbox profile allows METAL_CACHE_PATH (iconservicesagent's allows
++        // neither the cache directory itself nor the process's folder in it: every write there was denied, icons came out empty) --
++        // then the user cache directory, the process's own folder in it, the temp directory, else /private/var/tmp. A directory
++        // counts as writable when a file can be made in it: access() does not ask the sandbox.
++        char candidates[5][512] = {};
++        char cache[480] = {};
++        if (!confstr(_CS_DARWIN_USER_CACHE_DIR, cache, sizeof cache))
++            cache[0] = 0;
++        NSString *bundle = NSBundle.mainBundle.bundleIdentifier;
++        const char *owner = bundle.length ? bundle.UTF8String : getprogname();
++        if (cache[0]) {
++            snprintf(candidates[0], sizeof candidates[0] - 16, "%scom.apple.metal/", cache);
++            mkdir(candidates[0], 0700);
++            snprintf(candidates[0], sizeof candidates[0] - 16, "%scom.apple.metal/%s/", cache, owner);
++            mkdir(candidates[0], 0700);
++            strlcpy(candidates[1], cache, sizeof candidates[1] - 16);
++            if (bundle.length) {
++                snprintf(candidates[2], sizeof candidates[2] - 16, "%s%s/", cache, bundle.UTF8String);
++                mkdir(candidates[2], 0700);
++            }
+         }
+-        if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[2], sizeof candidates[2] - 16))
+-            candidates[2][0] = 0;
+-        strlcpy(candidates[3], "/private/var/tmp/", sizeof candidates[3]);
+-        for (unsigned i = 0; i < 4 && !device; i++) {
++        if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[3], sizeof candidates[3] - 16))
++            candidates[3][0] = 0;
++        strlcpy(candidates[4], "/private/var/tmp/", sizeof candidates[4]);
++        for (unsigned i = 0; i < 5 && !device; i++) {
+             if (!candidates[i][0])
+                 continue;
+             strlcat(candidates[i], "m2v", sizeof candidates[i]);
+             mkdir(candidates[i], 0700);
+-            if (access(candidates[i], W_OK) != 0)
++            char probe[600];
++            snprintf(probe, sizeof probe, "%s/.probe-%d", candidates[i], getpid());
++            int fd = open(probe, O_CREAT | O_EXCL | O_WRONLY, 0600);
++            if (fd < 0)
+                 continue;
++            close(fd);
++            unlink(probe);
+             @try {
+                 device = native_bridge_metal_open(turnip, candidates[i], registryID, missingSelector);
+             } @catch (NSException *exception) {

@@ -1,0 +1,99 @@
+From f0d10c6165be3ded1acf3945c38506414065f139 Mon Sep 17 00:00:00 2001
+From: leozhang <zwj8727@gmail.com>
+Date: Tue, 10 Nov 2026 00:53:22 +0800
+Subject: [PATCH] k27: VM guest: PSCI power-off at halt, dead union parents at
+ the final unmount, bootstrap tables for >6 GiB
+
+- halt_all_cpus ends with PSCI SYSTEM_OFF/SYSTEM_RESET over HVC (crosvm's /psci method): Gunyah ends the VM and crosvm exits
+  (XNU_VM_GUEST, set by build-k27-piano.sh).
+- vnode_rele_internal: a VBAD vnode released past zero is a union parent across mounts (SystemOS over /) reclaimed by the halt's
+  forced unmount; restore the count instead of panicking (counted in vnode_rele_dead_past_zero).
+- BOOTSTRAP_TABLE_SIZE for native 4 KiB: 48 pages (2 + 2*(GiB+1), up to 22 GiB); 16 overran start.s's area above 6 GiB.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ bsd/vfs/vfs_subr.c             | 18 ++++++++++++++++++
+ osfmk/arm/pmap/pmap.h          |  7 ++++---
+ osfmk/arm64/machine_routines.c | 11 +++++++++++
+ 3 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+index 456b500..282c705 100644
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -2661,6 +2661,10 @@ vnode_rele_ext(vnode_t vp, int fmode, int dont_reenter)
+ }
+ 
+ 
++#if XNU_VM_GUEST
++uint32_t vnode_rele_dead_past_zero;
++#endif
++
+ void
+ vnode_rele_internal(vnode_t vp, int fmode, int dont_reenter, int locked)
+ {
+@@ -2677,6 +2681,20 @@ vnode_rele_internal(vnode_t vp, int fmode, int dont_reenter, int locked)
+ #endif
+ 	/* Enable atomic ops on v_usecount without the vnode lock */
+ 	old_usecount = os_atomic_dec_orig(&vp->v_usecount, relaxed);
++#if XNU_VM_GUEST
++	if (old_usecount < 1 && vp->v_type == VBAD) {
++		/*
++		 * A reclaimed vnode a child still names as its parent across mounts: the union of the SystemOS
++		 * volume over / (patches 0015/0023/0024) gives vnodes of / parents on the SystemOS mount, which
++		 * the halt's forced unmount reclaims first, dropping its references; reclaiming the child then
++		 * releases the parent once more (vnode_update_identity). Nothing holds the dead vnode: put the
++		 * count back and carry on rather than panic in the middle of the shutdown.
++		 */
++		os_atomic_inc(&vp->v_usecount, relaxed);
++		os_atomic_inc(&vnode_rele_dead_past_zero, relaxed);   /* for the host rig (gpeek) */
++		goto done;
++	}
++#endif
+ 	if (old_usecount < 1) {
+ 		/*
+ 		 * Because we allow atomic ops on usecount (in lookup only, under
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index b236ca6..ab1de89 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -116,10 +116,11 @@
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
+ #elif !defined(APPLE_ARM64_ARCH_FAMILY) && !__ARM_16K_PG__
+-/* Native 4 KiB: two roots plus up to seven L2 pages per 6 GiB mapping.
+- * The physical and virtual bases may each straddle an extra 1 GiB region.
++/* Native 4 KiB: two roots plus, for each of the two bootstrap mappings (V=P and KVA), one L2 page per GiB of DRAM
++ * and one more where the base straddles a 1 GiB region: 2 + 2 * (GiB + 1). 16 pages covered 6 GiB: a 7 GiB guest
++ * overran the area in start.s and died before its first message (the piano, 2026-11-10). 48 cover 22 GiB (192 KiB).
+  */
+-#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 16)
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 48)
+ #else /* defined(ARM_LARGE_MEMORY) */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index f456377..2b62e95 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -934,6 +934,17 @@ halt_all_cpus(boolean_t reboot)
+ 		printf("CPU halted\n");
+ 		PEHaltRestart(kPEHaltCPU);
+ 	}
++#if XNU_VM_GUEST
++	/*
++	 * A VM guest ends here: PSCI SYSTEM_RESET or SYSTEM_OFF through the conduit crosvm's FDT names (/psci method "hvc"),
++	 * so the hypervisor ends the VM and crosvm exits (or restarts it), where the platform expert has no power-off of its
++	 * own and its reset went through SMC, which Gunyah does not route to PSCI.
++	 */
++	{
++		register uint64_t x0 __asm__("x0") = reboot ? 0x84000009ULL : 0x84000008ULL;
++		__asm__ volatile ("hvc #0" : "+r"(x0) : : "x1", "x2", "x3", "memory");
++	}
++#endif
+ 	while (1) {
+ 		;
+ 	}
+-- 
+2.55.0
+

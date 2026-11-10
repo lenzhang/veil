@@ -1,0 +1,22 @@
+--- a/DroidVMVTHost.cpp	2026-11-10 05:51:43
++++ b/DroidVMVTHost.cpp	2026-11-10 05:51:43
+@@ -2929,8 +2929,17 @@
+     case cc("dset"): replyStatus(c, h, 0); break;
+     // dsts: whether the session takes a (new) format description (,fds; VTDecompressionSessionCanAcceptFormatDescription).
+     // Answered -12900 by default, VideoToolbox dropped every HEVC session before its first frame (its sample descriptions
+-    // carry colr/chrm/clli extensions and are checked) and decoded in software. The device takes what the stream says.
+-    case cc("dsts"): replyStatus(c, h, 0); break;
++    // carry colr/chrm/clli extensions and are checked) and decoded in software. The device takes a video's format; a
++    // still image's HEVC tiles (HEIC: 512x512 grids, decoded with dtil, which this host does not do) stay with Apple's
++    // decoders -- accepted, ImageIO waited forever on its tile decodes and the login window and wallpapers stayed black.
++    case cc("dsts"): {
++        Param fds;
++        ImageDescription d;
++        const bool video = param(m, n, cc(",fds"), fds) && imageDescription(fds.value, fds.size, d) &&
++                           (d.width > 512 || d.height > 512);
++        replyStatus(c, h, video ? 0 : -12900);
++        break;
++    }
+     case cc("dmul"): replyStatus(c, h, 0); break;
+     case cc("dsta"): {
+         const int error = s ? startSession(s, m, n) : -12903;

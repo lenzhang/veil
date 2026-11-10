@@ -1,0 +1,441 @@
+diff --git a/device/Cargo.toml b/device/Cargo.toml
+index 4e64339..d9fc621 100644
+--- a/device/Cargo.toml
++++ b/device/Cargo.toml
+@@ -15,7 +15,7 @@ log = "0.4.20"
+ nix = { version = "0.28", features = ["fs"] }
+ thiserror = "1.0.38"
+ # Use 64-bit bindings as this is the format used by virtio-media
+-v4l2r = { version = "0.0.5", features = ["arch64"] }
++v4l2r = { path = "../../v4l2r/lib", features = ["arch64"] }
+ zerocopy = { version = "0.7.31", features = ["derive"] }
+ 
+ [features]
+diff --git a/device/src/devices/v4l2_device_proxy.rs b/device/src/devices/v4l2_device_proxy.rs
+index 6cbc447..d2efc5a 100644
+--- a/device/src/devices/v4l2_device_proxy.rs
++++ b/device/src/devices/v4l2_device_proxy.rs
+@@ -62,6 +62,7 @@ use v4l2r::ioctl::DqEventError;
+ use v4l2r::ioctl::EventType as V4l2EventType;
+ use v4l2r::ioctl::ExpbufFlags;
+ use v4l2r::ioctl::IntoErrno;
++use v4l2r::ioctl::PlaneMapping;
+ use v4l2r::ioctl::QueryCapError;
+ use v4l2r::ioctl::QueryCtrlFlags;
+ use v4l2r::ioctl::SelectionFlags;
+@@ -241,6 +242,51 @@ struct V4l2UserPlaneInfo<R> {
+     _guest_resource: R,
+ }
+ 
++/// A USERPTR queue the host driver does not take (Iris answers USERPTR with `EINVAL`: it has MMAP
++/// and DMABUF), emulated on MMAP buffers of the host's. The guest sees USERPTR buffers only, its
++/// addresses echoed back; QBUF copies an OUTPUT buffer's payload from the guest's pages into the
++/// host buffer, a dequeued CAPTURE buffer's payload is copied out into them. For guests whose
++/// virtio-media device has no shared-memory window to map MMAP buffers through (crosvm on Gunyah,
++/// where the GPU's took the room).
++struct ShadowQueue<R> {
++    queue: QueueType,
++    buffers: Vec<ShadowBuffer<R>>,
++}
++
++struct ShadowBuffer<R> {
++    /// The host buffer's planes, mapped here, and their MMAP offsets.
++    planes: Vec<(PlaneMapping, u32)>,
++    /// While queued: the guest's buffer as it was given, and its planes mapped (`None` for a
++    /// plane of length 0).
++    guest: Option<(V4l2Buffer, Vec<Option<R>>)>,
++}
++
++fn guest_userptrs(buffer: &V4l2Buffer) -> Vec<GuestAddrType> {
++    match buffer.planes_with_backing_iter() {
++        V4l2PlanesWithBacking::UserPtr(planes) => planes.map(|p| p.userptr()).collect(),
++        _ => vec![],
++    }
++}
++
++fn set_memory(buffer: &mut V4l2Buffer, memory: MemoryType) {
++    // SAFETY: only the memory type changes; the caller rewrites every plane's backing next.
++    unsafe { (*buffer.as_mut_ptr()).memory = memory as u32 };
++}
++
++/// A host buffer of a shadowed queue as the guest knows it: USERPTR, with the guest's addresses
++/// (those of `guest`, or 0 for a buffer the guest has not queued).
++fn shadow_buffer_to_guest(host_buffer: &V4l2Buffer, guest: Option<&V4l2Buffer>) -> V4l2Buffer {
++    let addrs = guest.map(guest_userptrs).unwrap_or_default();
++    let mut buffer = host_buffer.clone();
++    set_memory(&mut buffer, MemoryType::UserPtr);
++    if let V4l2PlanesWithBackingMut::UserPtr(planes) = buffer.planes_with_backing_iter_mut() {
++        for (i, mut plane) in planes.enumerate() {
++            plane.set_userptr(addrs.get(i).copied().unwrap_or(0));
++        }
++    }
++    buffer
++}
++
+ pub struct V4l2Session<M: VirtioMediaGuestMemoryMapper> {
+     id: u32,
+     device: Arc<V4l2Device>,
+@@ -266,6 +312,9 @@ pub struct V4l2Session<M: VirtioMediaGuestMemoryMapper> {
+     /// TODO this is not properly cleared. We should probably record the session ID and queue in
+     /// order to remove the records upon REQBUFS or session deletion?
+     userptr_buffers: BTreeMap<GuestAddrType, V4l2UserPlaneInfo<M::GuestMemoryMapping>>,
++
++    /// USERPTR queues emulated on host MMAP buffers (see [`ShadowQueue`]).
++    shadow: Vec<ShadowQueue<M::GuestMemoryMapping>>,
+ }
+ 
+ impl<M: VirtioMediaGuestMemoryMapper> VirtioMediaDeviceSession for V4l2Session<M> {
+@@ -294,9 +343,55 @@ where
+             output_streaming: false,
+             output_num_queued: 0,
+             userptr_buffers: Default::default(),
++            shadow: Default::default(),
+         }
+     }
+ 
++    fn shadow_queue(&self, queue: QueueType) -> Option<&ShadowQueue<M::GuestMemoryMapping>> {
++        self.shadow.iter().find(|s| s.queue == queue)
++    }
++
++    fn shadow_queue_mut(
++        &mut self,
++        queue: QueueType,
++    ) -> Option<&mut ShadowQueue<M::GuestMemoryMapping>> {
++        self.shadow.iter_mut().find(|s| s.queue == queue)
++    }
++
++    /// A buffer just dequeued from the host: if its queue is shadowed, a CAPTURE buffer's payload
++    /// goes to the guest's pages, and the buffer is turned back into the guest's USERPTR one.
++    fn shadow_dequeued(&mut self, host_buffer: V4l2Buffer) -> V4l2Buffer {
++        let queue = host_buffer.queue();
++        let Some(sq) = self.shadow_queue_mut(queue) else {
++            return host_buffer;
++        };
++        let Some(sb) = sq.buffers.get_mut(host_buffer.index() as usize) else {
++            return host_buffer;
++        };
++        let Some((guest_buffer, mut mappings)) = sb.guest.take() else {
++            return shadow_buffer_to_guest(&host_buffer, None);
++        };
++        if queue.direction() == QueueDirection::Capture {
++            let guest_lengths: Vec<u32> = guest_buffer.planes_iter().map(|p| *p.length).collect();
++            for (i, plane) in host_buffer.planes_iter().enumerate() {
++                let (Some((host_plane, _)), Some(Some(mapping))) = (sb.planes.get(i), mappings.get_mut(i))
++                else {
++                    continue;
++                };
++                let n = (*plane.bytesused as usize)
++                    .min(host_plane.size())
++                    .min(mapping.len())
++                    .min(guest_lengths.get(i).copied().unwrap_or(0) as usize);
++                // SAFETY: `n` is within both the host plane's mapping and the guest's.
++                unsafe {
++                    std::ptr::copy_nonoverlapping(host_plane.as_ref().as_ptr(), mapping.as_mut_ptr(), n)
++                };
++            }
++        }
++        drop(mappings);
++        shadow_buffer_to_guest(&host_buffer, Some(&guest_buffer))
++    }
++
+     /// Returns whether this session should be polling for CAPTURE buffers in its current state.
+     fn should_poll_capture(&self) -> bool {
+         self.capture_streaming && self.capture_num_queued > 0
+@@ -370,6 +465,10 @@ pub struct V4l2ProxyDevice<
+     mmap_buffers: BTreeMap<u32, V4l2MmapPlaneInfo>,
+ 
+     mmap_manager: MmapMappingManager<HM>,
++
++    /// Queues on which the host device refused USERPTR: the guest's USERPTR buffers there are
++    /// shadowed by MMAP ones (see [`ShadowQueue`]).
++    userptr_refused: Vec<QueueType>,
+ }
+ 
+ #[derive(Debug)]
+@@ -390,6 +489,7 @@ where
+             device_path,
+             mmap_buffers: Default::default(),
+             mmap_manager: MmapMappingManager::from(mapper),
++            userptr_refused: Default::default(),
+         }
+     }
+ 
+@@ -515,6 +615,7 @@ where
+                         Some(v.queue) != session.output_queue_type
+                             || v.index != buffer.index() as u8
+                     });
++                    let buffer = session.shadow_dequeued(buffer);
+                     self.evt_queue
+                         .send_event(V4l2Event::DequeueBuffer(DequeueBufferEvent::new(
+                             session.id, buffer,
+@@ -559,6 +660,7 @@ where
+         session.userptr_buffers.retain(|_, v| {
+             Some(v.queue) != session.capture_queue_type || v.index != v4l2_buffer.index() as u8
+         });
++        let v4l2_buffer = session.shadow_dequeued(v4l2_buffer);
+ 
+         let capture_polling_active = session.should_poll_capture();
+         session.capture_num_queued -= 1;
+@@ -581,6 +683,87 @@ where
+     }
+ }
+ 
++impl<Q, M, HM> V4l2ProxyDevice<Q, M, HM>
++where
++    Q: VirtioMediaEventQueue,
++    M: VirtioMediaGuestMemoryMapper,
++    HM: VirtioMediaHostMemoryMapper,
++{
++    /// QBUF of a guest USERPTR buffer on a shadowed queue: its host MMAP twin is queued instead,
++    /// with an OUTPUT buffer's payload copied in first.
++    fn shadow_qbuf(
++        &mut self,
++        session: &mut V4l2Session<M>,
++        guest_buffer: V4l2Buffer,
++        guest_regions: Vec<Vec<SgEntry>>,
++    ) -> IoctlResult<V4l2Buffer> {
++        if guest_buffer.memory() != MemoryType::UserPtr {
++            return Err(libc::EINVAL);
++        }
++        let queue = guest_buffer.queue();
++        let writable = queue.direction() == QueueDirection::Capture;
++        let mut regions = guest_regions.into_iter();
++        let mut mappings = vec![];
++        for plane in guest_buffer.planes_iter() {
++            mappings.push(if *plane.length > 0 {
++                let sgs = regions.next().ok_or(libc::EINVAL)?;
++                Some(
++                    self.mem
++                        .new_mapping_for(sgs, writable)
++                        .map_err(|e| guest_mapping_errno(&e))?,
++                )
++            } else {
++                None
++            });
++        }
++
++        let sq = session.shadow_queue_mut(queue).ok_or(libc::EINVAL)?;
++        let sb = sq
++            .buffers
++            .get_mut(guest_buffer.index() as usize)
++            .ok_or(libc::EINVAL)?;
++        if sb.guest.is_some() {
++            return Err(libc::EINVAL);
++        }
++        let mut host_buffer = guest_buffer.clone();
++        set_memory(&mut host_buffer, MemoryType::Mmap);
++        {
++        if let V4l2PlanesWithBackingMut::Mmap(planes) = host_buffer.planes_with_backing_iter_mut() {
++            for (i, mut plane) in planes.enumerate() {
++                let (host_plane, offset) = sb.planes.get_mut(i).ok_or(libc::EINVAL)?;
++                plane.set_mem_offset(*offset);
++                *plane.length = host_plane.size() as u32;
++                if !writable {
++                    if let Some(Some(mapping)) = mappings.get(i) {
++                        let n = (*plane.bytesused as usize)
++                            .min(host_plane.size())
++                            .min(mapping.len());
++                        // SAFETY: `n` is within both the guest's mapping and the host plane's.
++                        unsafe {
++                            std::ptr::copy_nonoverlapping(
++                                mapping.as_ptr(),
++                                host_plane.as_mut().as_mut_ptr(),
++                                n,
++                            )
++                        };
++                    }
++                }
++            }
++        }
++        }
++        let host_out_buffer = v4l2r::ioctl::qbuf::<_, V4l2Buffer>(&session.device, host_buffer)
++            .map_err(|e| e.into_errno())?;
++        let out_buffer = shadow_buffer_to_guest(&host_out_buffer, Some(&guest_buffer));
++        if let Some(sb) = session
++            .shadow_queue_mut(queue)
++            .and_then(|sq| sq.buffers.get_mut(guest_buffer.index() as usize))
++        {
++            sb.guest = Some((guest_buffer, mappings));
++        }
++        Ok(out_buffer)
++    }
++}
++
+ impl<Q, M, HM> VirtioMediaIoctlHandler for V4l2ProxyDevice<Q, M, HM>
+ where
+     Q: VirtioMediaEventQueue,
+@@ -618,14 +801,65 @@ where
+         memory: MemoryType,
+         count: u32,
+     ) -> IoctlResult<v4l2_requestbuffers> {
+-        let mut reqbufs: v4l2_requestbuffers =
+-            v4l2r::ioctl::reqbufs(&session.device, queue, memory, count)
+-                .map_err(IntoErrno::into_errno)?;
++        // REQBUFS frees the queue's buffers, shadowed ones included.
++        session.shadow.retain(|s| s.queue != queue);
++        let mut shadowed =
++            memory == MemoryType::UserPtr && self.userptr_refused.contains(&queue);
++        let mut reqbufs: v4l2_requestbuffers = match v4l2r::ioctl::reqbufs::<v4l2_requestbuffers>(
++            &session.device,
++            queue,
++            if shadowed { MemoryType::Mmap } else { memory },
++            count,
++        )
++        .map_err(IntoErrno::into_errno)
++        {
++            Err(libc::EINVAL) if memory == MemoryType::UserPtr && !shadowed => {
++                warn!("host device refuses USERPTR on {:?}: shadowing it with MMAP buffers", queue);
++                self.userptr_refused.push(queue);
++                shadowed = true;
++                v4l2r::ioctl::reqbufs(&session.device, queue, MemoryType::Mmap, count)
++                    .map_err(IntoErrno::into_errno)?
++            }
++            r => r?,
++        };
+ 
+         // We do not support requests at the moment, so do not advertize them.
+         reqbufs.capabilities &= !v4l2r::bindings::V4L2_BUF_CAP_SUPPORTS_REQUESTS;
+ 
+-        self.update_mmap_offsets(session, queue, 0..reqbufs.count);
++        if shadowed {
++            reqbufs.memory = MemoryType::UserPtr as u32;
++            reqbufs.capabilities |= v4l2r::bindings::V4L2_BUF_CAP_SUPPORTS_USERPTR;
++            // No guest MMAP for these, but the queue's old MMAP records go and its type is noted.
++            self.update_mmap_offsets(session, queue, 0..0);
++            let mut buffers = vec![];
++            for i in 0..reqbufs.count {
++                let host_buffer =
++                    v4l2r::ioctl::querybuf::<V4l2Buffer>(&session.device, queue, i as usize)
++                        .map_err(IntoErrno::into_errno)?;
++                let mut planes = vec![];
++                if let V4l2PlanesWithBacking::Mmap(host_planes) = host_buffer.planes_with_backing_iter()
++                {
++                    for plane in host_planes {
++                        let offset = plane.mem_offset();
++                        let mapping = v4l2r::ioctl::mmap(&session.device, offset, *plane.length)
++                            .map_err(|e| {
++                                error!("cannot map shadow buffer {} of {:?}: {:#}", i, queue, e);
++                                libc::ENOMEM
++                            })?;
++                        planes.push((mapping, offset));
++                    }
++                }
++                buffers.push(ShadowBuffer {
++                    planes,
++                    guest: None,
++                });
++            }
++            if !buffers.is_empty() {
++                session.shadow.push(ShadowQueue { queue, buffers });
++            }
++        } else {
++            self.update_mmap_offsets(session, queue, 0..reqbufs.count);
++        }
+ 
+         match queue {
+             QueueType::VideoCapture | QueueType::VideoCaptureMplane => {
+@@ -663,6 +897,17 @@ where
+         queue: QueueType,
+         index: u32,
+     ) -> IoctlResult<V4l2Buffer> {
++        if let Some(sq) = session.shadow_queue(queue) {
++            let host_buffer: V4l2Buffer =
++                v4l2r::ioctl::querybuf(&session.device, queue, index as usize)
++                    .map_err(IntoErrno::into_errno)?;
++            let guest = sq
++                .buffers
++                .get(index as usize)
++                .and_then(|b| b.guest.as_ref())
++                .map(|(g, _)| g);
++            return Ok(shadow_buffer_to_guest(&host_buffer, guest));
++        }
+         v4l2r::ioctl::querybuf(&session.device, queue, index as usize)
+             .map_err(IntoErrno::into_errno)
+             .and_then(|host_buffer| {
+@@ -698,6 +943,9 @@ where
+ 
+     fn streamoff(&mut self, session: &mut Self::Session, queue: QueueType) -> IoctlResult<()> {
+         v4l2r::ioctl::streamoff(&session.device, queue).map_err(IntoErrno::into_errno)?;
++        if let Some(sq) = session.shadow_queue_mut(queue) {
++            sq.buffers.iter_mut().for_each(|b| b.guest = None);
++        }
+ 
+         match queue {
+             QueueType::VideoCapture | QueueType::VideoCaptureMplane => {
+@@ -749,12 +997,15 @@ where
+         // this context.
+         let _ = self.dequeue_output_buffers(session);
+ 
++        let queue = guest_buffer.queue();
++        let out_buffer = if session.shadow_queue(queue).is_some() {
++            self.shadow_qbuf(session, guest_buffer, guest_regions)?
++        } else {
+         let (host_buffer, guest_resources) =
+             guest_v4l2_buffer_to_host(&guest_buffer, guest_regions, &self.mem)
+                 .map_err(|e| guest_mapping_errno(&e))?;
+         session.register_userptr_addresses(&host_buffer, &guest_buffer, guest_resources);
+-        let queue = host_buffer.queue();
+-        let out_buffer = v4l2r::ioctl::qbuf(&session.device, host_buffer)
++        v4l2r::ioctl::qbuf(&session.device, host_buffer)
+             .map_err(|e| e.into_errno())
+             .and_then(|host_out_buffer| {
+                 // TODO if we had a PREPARE_BUF before, do we need to patch the addresses
+@@ -763,7 +1014,8 @@ where
+                     error!("{:#}", e.context("while processing QBUF"));
+                     libc::EINVAL
+                 })
+-            })?;
++            })?
++        };
+ 
+         match queue {
+             QueueType::VideoCapture | QueueType::VideoCaptureMplane => {
+@@ -1115,6 +1367,9 @@ where
+         memory: MemoryType,
+         format: v4l2_format,
+     ) -> IoctlResult<v4l2_create_buffers> {
++        if session.shadow_queue(queue).is_some() {
++            return Err(libc::EINVAL);
++        }
+         let create_bufs = v4l2r::ioctl::create_bufs::<_, v4l2_create_buffers>(
+             &session.device,
+             count,
+@@ -1145,6 +1400,9 @@ where
+         ) {
+             return Err(libc::EINVAL);
+         }
++        if session.shadow_queue(guest_buffer.queue()).is_some() {
++            return Err(libc::EINVAL);
++        }
+         let (host_buffer, guest_resources) =
+             guest_v4l2_buffer_to_host(&guest_buffer, guest_regions, &self.mem)
+                 .map_err(|e| guest_mapping_errno(&e))?;
+diff --git a/device/src/ioctl.rs b/device/src/ioctl.rs
+index cb7ba9d..5f2b358 100644
+--- a/device/src/ioctl.rs
++++ b/device/src/ioctl.rs
+@@ -71,7 +71,10 @@ use crate::protocol::V4l2Ioctl;
+ /// another host mapping. 4096 entries of 4 KiB pages is 16 MiB, more than a 4K frame, and four
+ /// times what the guest driver's own shadow buffer can hold at 16 bytes per entry (64 KiB, see
+ /// `VPU_DESIGN.md` §5.2), so nothing that is expected to work is refused.
+-pub const MAX_SG_ENTRIES: usize = 4096;
++///
++/// DroidVM (piano): 16384, the guest's own bound (DroidVMVTHost MaxSgEntries): a 4K P010 frame in a guest pool
++/// surface of 4 KiB pages is 6528 entries (the aerial wallpapers), refused at 4096 with `invalid data`.
++pub const MAX_SG_ENTRIES: usize = 16384;
+ 
+ /// Reads a SG list of guest physical addresses passed from the driver and returns it.
+ ///
+@@ -313,8 +316,10 @@ impl FromDescriptorChain for GuestV4l2Buffer {
+             planes
+                 .filter(|p| *p.length > 0)
+                 .map(|p| {
+-                    get_userptr_regions(reader, *p.length as usize)
+-                        .map_err(|_| std::io::ErrorKind::InvalidData.into())
++                    get_userptr_regions(reader, *p.length as usize).map_err(|e| {
++                        log::warn!("USERPTR plane of {} bytes: {:#}", *p.length, e);
++                        std::io::ErrorKind::InvalidData.into()
++                    })
+                 })
+                 .collect::<IoResult<Vec<_>>>()?
+         } else {

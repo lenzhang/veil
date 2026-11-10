@@ -1,0 +1,8 @@
+# UniXNU-droidvm-hk
+remote: https://github.com/Droid-VM/UniXNU-droidvm.git
+HEAD: de1061a40f8c337c3c7f2018d55d7fa87c5750fa
+branch: wip/hackintosh
+
+## status
+
+## submodule status

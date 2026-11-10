@@ -1,0 +1,16 @@
+diff --git a/gpu_display/src/display_wl.c b/gpu_display/src/display_wl.c
+index b195c42..67ca9ca 100644
+--- a/gpu_display/src/display_wl.c
++++ b/gpu_display/src/display_wl.c
+@@ -693,6 +693,11 @@ static void surface_enter(void *data, struct wl_surface *wl_surface,
+ 
+ 	surface->scale = (output->device_scale_factor / 1000.0) *
+ 			 (output->current_scale / 1000.0);
++	// DroidVM: CROSVM_WL_SURFACE_SCALE=1 shows the guest's buffer pixel for logical pixel on a scaled output (the
++	// thin host's kiosk: a 1600x1068 guest on the 3200x2136 panel at scale 2 fills it, upscaled by the compositor).
++	const char *forced_scale = getenv("CROSVM_WL_SURFACE_SCALE");
++	if (forced_scale && atof(forced_scale) > 0)
++		surface->scale = atof(forced_scale);
+ 
+ 	if (surface->viewport) {
+ 		wp_viewport_set_destination(

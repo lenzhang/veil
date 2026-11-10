@@ -1,0 +1,10 @@
+# UniXNU-droidvm-piano
+remote: https://github.com/Droid-VM/UniXNU-droidvm.git
+HEAD: bf7fc44cc3b1a92c842c84aa980993eaa74a2cd8
+branch: 
+
+## status
+ M board.toml
+?? build/
+
+## submodule status

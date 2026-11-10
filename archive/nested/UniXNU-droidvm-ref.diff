@@ -1,0 +1,48 @@
+diff --git a/board.toml b/board.toml
+index 9bc5aa2..9f8842d 100644
+--- a/board.toml
++++ b/board.toml
+@@ -36,17 +36,9 @@ archives = [
+   # build/reference-candidate/kernel.{macho,json}, a prelinked kernel of this board built WITHOUT
+   # CONFIG_XNU_NATIVE_VIRTIO_BLOCK / RAM_BLOCK / LEGACY_DISPLAY (original kext addresses do not move between
+   # builds). A build from scratch therefore links one such kernel first and copies it there.
+-  "audit-storage-interface-static.py",
+   # Owner root: OS + SystemOS policies (build-owner-os-policy.py, build-owner-systemos-policy.py) must exist.
+-  "build-verified-root-probe.py --component os --include-systemos",
+-  "build-arm-driver.py NativeVirtioBlock --verified-root --verified-root-bundle",
+-  "build-native-virtio-bindings.py --component NativeVirtioBlock --directory build/native-virtio-block-verified-bundle",
+-  "build-arm-driver.py NativeRamBlock",
+-  "build-native-virtio-bindings.py --component NativeRamBlock --directory build/native-ram-block",
+   "build-libpthread-kernel.py",
+   # The paravirtual Adreno over crosvm's droidvm-gpu device (the host's KGSL); its objects ride in the display archive below.
+-  "build-droidvm-gpu.py",
+-  "build-native-legacy-display.py",
+ ]
+ 
+ [kernel.prelink]
+diff --git a/configs/droidvm_defconfig b/configs/droidvm_defconfig
+index 04f143c..61afd9e 100644
+--- a/configs/droidvm_defconfig
++++ b/configs/droidvm_defconfig
+@@ -40,3 +40,21 @@ CONFIG_XNU_NATIVE_ADRENO=n
+ CONFIG_XNU_BOOT_PROGRESS=n
+ CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+ CONFIG_XNU_ARMVIRT_PLATFORM=n
++
++# Reference candidate (ci/scripts/make-reference-device.py)
++CONFIG_XNU_NATIVE_VIRTIO_BLOCK=n
++CONFIG_XNU_NATIVE_RAM_BLOCK=n
++CONFIG_XNU_NATIVE_LEGACY_DISPLAY=n
++CONFIG_XNU_VERIFIED_ROOT_PROBE=n
++CONFIG_XNU_OWNER_ROOT_AUDIT=n
++CONFIG_XNU_OWNER_ROOT_TRUST=n
++CONFIG_XNU_OWNER_CACHE_MOUNT=n
++CONFIG_XNU_OWNER_CACHE_STARTUP=n
++CONFIG_XNU_OWNER_BOOT_MANIFEST=n
++CONFIG_XNU_OWNER_DATA_MOUNT=n
++CONFIG_XNU_OWNER_UNION_SYSTEMOS=n
++CONFIG_XNU_OWNER_CACHE_CARRIER=n
++CONFIG_XNU_BOARD_LAUNCH_POLICY=n
++CONFIG_XNU_NATIVE_VIRTIO_BLOCK_ARCHIVE=""
++CONFIG_XNU_VERIFIED_ROOT_ARCHIVE=""
++CONFIG_XNU_EXTRA_LD_ARCHIVES=""

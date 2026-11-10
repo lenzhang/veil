@@ -1,0 +1,20 @@
+--- a/DroidVMVTHost.cpp	2026-11-10 05:10:08
++++ b/DroidVMVTHost.cpp	2026-11-10 05:10:08
+@@ -710,12 +710,16 @@
+         p += 23;
+         for (unsigned a = 0; a < arrays; ++a) {
+             if (end - p < 3) return false;
++            // SEI arrays (prefix 39, suffix 40) are no parameter sets: x265 (every ffmpeg-made HEVC file) keeps a ~2 KB SEI
++            // with its settings in hvcC, which overflowed parameterSets and failed the session (-12909) before any frame.
++            const unsigned type = p[0] & 0x3f;
++            const bool sei = type == 39 || type == 40;
+             const unsigned count = be16(p + 1);
+             p += 3;
+             for (unsigned i = 0; i < count; ++i) {
+                 if (end - p < 2) return false;
+                 const uint32_t n = be16(p);
+-                if (uint32_t(end - p) < 2 + n || !add(p + 2, n)) return false;
++                if (uint32_t(end - p) < 2 + n || (!sei && !add(p + 2, n))) return false;
+                 p += 2 + n;
+             }
+         }

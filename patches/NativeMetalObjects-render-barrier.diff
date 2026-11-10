@@ -1,0 +1,43 @@
+--- /tmp/NativeMetalObjects.rs.bak	2026-11-10 01:27:29.355371096 +0800
++++ NativeMetalObjects.rs	2026-11-10 01:27:29.370371082 +0800
+@@ -9,7 +9,7 @@
+ use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
+ use metal2vulkan::metal::{
+     BindingAccess, BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
+-    PrimitiveType, RenderStages, ResourceUsage, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
++    PrimitiveType, BarrierScope, RenderStages, ResourceUsage, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
+     TessellationControlPointIndexType, TessellationFactorFormat, TessellationFactorStepFunction, TessellationPartitionMode, TextureSwizzle,
+     TextureSwizzleChannels, TextureUsage,
+     TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
+@@ -3177,6 +3177,20 @@
+ }
+ 
+ /// SPI `setLineWidth:`: the runtime accepts Metal's default width of 1 and refuses any other (Apple's wide-line rule is unmeasured).
++/// `-[MTLRenderCommandEncoder memoryBarrierWithScope:afterStages:beforeStages:]`: the runtime splits the pass where a
++/// later draw reads what an earlier one wrote. RenderBox accumulates path coverage in a render target and reads it back in
++/// the same encoder; with the call dropped, SwiftUI glyphs and IconRendering icons came out as blocks or nothing.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_memory_barrier(encoder: *mut NmbEncoder, scope: u64, after: u64, before: u64) -> bool {
++    guard(false, || {
++        let scope = raw::<BarrierScope>(scope, "barrier scope")?;
++        let after = raw::<RenderStages>(after, "render stages")?;
++        let before = raw::<RenderStages>(before, "render stages")?;
++        render(encoder)?.memory_barrier_with_scope(scope, after, before);
++        Ok(true)
++    })
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_line_width(encoder: *mut NmbEncoder, width: f32) -> bool {
+     guard(false, || {
+--- /tmp/NativeMetalObjects.h.bak	2026-11-10 01:27:29.356371096 +0800
++++ NativeMetalObjects.h	2026-11-10 01:27:29.370371082 +0800
+@@ -357,6 +357,8 @@
+ bool nmb_render_set_blend_color(NmbEncoder *, const float color[4]);
+ bool nmb_render_set_depth_bias(NmbEncoder *, float bias, float slope_scale, float clamp);
+ bool nmb_render_set_line_width(NmbEncoder *, float width);
++/* scope: MTLBarrierScope, after/before: MTLRenderStages */
++bool nmb_render_memory_barrier(NmbEncoder *, uint64_t scope, uint64_t after, uint64_t before);
+ bool nmb_render_set_visibility_mode(NmbEncoder *, uint64_t mode, uint64_t offset);
+ bool nmb_render_draw(NmbEncoder *, uint64_t primitive, uint32_t start, uint32_t count, uint32_t instances, uint32_t base_instance);
+ /* NULL indices: drawPrimitives:indirectBuffer:; otherwise the indexed indirect draw. */

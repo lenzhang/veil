@@ -1,0 +1,637 @@
+--- ghk-abi2/ghk_uapi.h
++++ ghk-abi3/ghk_uapi.h
+@@ -9,8 +9,13 @@
+  *
+  * ABI 2 (stage 3, crosvm-ghk anchor): serial_irqfd + GHK_LAUNCH_SERIAL_IRQ (edge interrupt of the in-kernel
+  * 16550, an eventfd the anchor registered with GUNYAH_FN_IRQFD), max_run_ms (mandatory kernel-side bound on a
+- * live launch), status.launched / status.flags. Struct sizes are unchanged (120 / 80 bytes); fields carved out
+- * of the old reserved space.
++ * live launch), status.launched / status.flags.
++ *
++ * ABI 3 (stage 4, userspace MMIO exit channel): GHK_LAUNCH_MMIO_FWD + mmio_timeout_ms. Every MMIO exit that
++ * ghk does not handle in the kernel is posted to the anchor; the vcpu thread sleeps until the anchor answers
++ * with GHK_IOC_MMIO_XFER (or mmio_timeout_ms expires: the vcpu then stops with -ETIMEDOUT, fail-stop, the guest
++ * never sees an invented value). One ioctl per access: it completes the previous request and waits for the next.
++ * Struct sizes of launch/status are unchanged (120 / 80 bytes); fields carved out of the reserved space.
+  */
+ #ifndef _UAPI_GHK_H
+ #define _UAPI_GHK_H
+@@ -19,13 +24,14 @@
+ #include <linux/types.h>
+ 
+ #define GHK_IOCTL_TYPE		0xB7
+-#define GHK_ABI_VERSION		2
++#define GHK_ABI_VERSION		3
+ #define GHK_MAX_VCPUS		8
+ 
+ /* ghk_launch.flags */
+ #define GHK_LAUNCH_DRY_RUN	(1u << 0)	/* validate and log only, even with allow_launch=1 */
+ #define GHK_LAUNCH_SERIAL	(1u << 1)	/* model a 16550 at serial_base in the kernel */
+ #define GHK_LAUNCH_SERIAL_IRQ	(1u << 2)	/* serial_irqfd is valid: signal it on THRE interrupts (edge) */
++#define GHK_LAUNCH_MMIO_FWD	(1u << 3)	/* ABI 3: forward unhandled MMIO exits to GHK_IOC_MMIO_XFER */
+ 
+ struct ghk_launch {
+ 	__u32 flags;
+@@ -37,29 +43,66 @@
+ 	__u64 serial_base;			/* guest PA of the 16550 (crosvm: 0x3f8), 8 bytes wide */
+ 	__s32 serial_irqfd;			/* eventfd; only read with GHK_LAUNCH_SERIAL_IRQ */
+ 	__u32 max_run_ms;			/* live launch: 1..max_run_ms module param, then the vcpus are kicked out */
+-	__u64 reserved[3];			/* must be 0 */
++	__u32 mmio_timeout_ms;			/* MMIO_FWD: 1..mmio_timeout_ms param, < max_run_ms; else must be 0 */
++	__u32 pad1;				/* must be 0 */
++	__u64 reserved[2];			/* must be 0 */
+ };
+ 
+ /* ghk_status.flags */
+ #define GHK_STATUS_TIMED_OUT	(1u << 0)	/* max_run_ms expired and the vcpus were kicked out */
++#define GHK_STATUS_MMIO_FWD	(1u << 1)	/* the exit channel is open (live launch with MMIO_FWD, not stopped) */
+ 
+ struct ghk_status {
+ 	__u32 running;				/* number of vcpu threads still inside their run loop */
+ 	__u32 launched;				/* 1 between a live LAUNCH and STOP/release */
+-	__u64 exits_mmio;
+-	__u64 exits_mmio_unhandled;
++	__u64 exits_mmio;			/* all MMIO exits (in-kernel + forwarded + unhandled) */
++	__u64 exits_mmio_unhandled;		/* neither in-kernel nor forwarded: read 0 / write dropped */
+ 	__u64 exits_other;
+ 	__u64 serial_bytes;
+-	__s32 last_error;
++	__s32 last_error;			/* -ETIMEDOUT: the anchor did not answer an MMIO request in time */
+ 	__u32 vm_status;			/* GUNYAH_VM_STATUS_* seen on the last STATUS exit, 0 = none */
+ 	__u32 flags;				/* GHK_STATUS_* */
+ 	__u32 exit_type;			/* status.exit_info.type of the last STATUS exit */
+-	__u64 reserved[3];
++	__u64 exits_mmio_fwd;			/* ABI 3: MMIO exits answered by the anchor */
++	__u32 mmio_fwd_timeouts;		/* ABI 3: requests the anchor did not answer within mmio_timeout_ms */
++	__u32 pad;
++	__u64 reserved[1];
+ };
+ 
++/* One forwarded MMIO access (32 bytes). */
++struct ghk_mmio_req {
++	__u64 seq;				/* kernel-assigned, never 0; next.seq == 0: no request within wait_ms */
++	__u64 phys_addr;			/* guest PA */
++	__u8 data[8];				/* bytes [0, len) of the access: write = guest's value, read = answer */
++	__u32 len;				/* 1..8 (as reported by the hypervisor) */
++	__u8 is_write;
++	__u8 vcpu;				/* vcpu index 0..nr_vcpus-1 */
++	__u16 pad;
++};
++
++/* ghk_mmio_xfer.flags */
++#define GHK_MMIO_COMPLETE	(1u << 0)	/* 'done' answers the in-service request done.seq of vcpu done.vcpu */
++
++#define GHK_MMIO_MAX_WAIT_MS	1000
++
++struct ghk_mmio_xfer {
++	__u32 flags;				/* GHK_MMIO_COMPLETE or 0 */
++	__u32 wait_ms;				/* 0..GHK_MMIO_MAX_WAIT_MS: how long to wait for the next request */
++	struct ghk_mmio_req done;		/* in: (COMPLETE) seq, vcpu, data for reads; other fields ignored */
++	struct ghk_mmio_req next;		/* out: the next request (now in service), or seq 0 */
++	__u64 reserved[2];			/* must be 0 */
++};
++
++/*
++ * GHK_IOC_MMIO_XFER return values: 0 (next filled, possibly seq 0), -ENOTCONN (no open exit channel: not
++ * launched with MMIO_FWD, or stopped -- the server loop ends), -ESTALE (done did not match an in-service
++ * request, e.g. the vcpu already timed out or was stopped; next is NOT filled), -EINVAL, -EPERM (not the
++ * launching process), -EFAULT.
++ */
+ #define GHK_IOC_VERSION		_IO(GHK_IOCTL_TYPE, 0x00)	/* returns GHK_ABI_VERSION */
+ #define GHK_IOC_LAUNCH		_IOW(GHK_IOCTL_TYPE, 0x01, struct ghk_launch)
+ #define GHK_IOC_STOP		_IO(GHK_IOCTL_TYPE, 0x02)
+ #define GHK_IOC_STATUS		_IOR(GHK_IOCTL_TYPE, 0x03, struct ghk_status)
++#define GHK_IOC_MMIO_XFER	_IOWR(GHK_IOCTL_TYPE, 0x04, struct ghk_mmio_xfer)
+ 
+ #endif /* _UAPI_GHK_H */
+--- ghk-abi2/ghk_main.c
++++ ghk-abi3/ghk_main.c
+@@ -1,10 +1,13 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+- * ghk -- Gunyah kernel launcher, stage-2 skeleton (kernel-first VMM roadmap, piano 7.2.15-piano58usb1).
++ * ghk -- Gunyah kernel launcher (kernel-first VMM roadmap, piano 7.2.15-piano58usb1), ABI 3.
+  *
+  * /dev/ghk takes a VM that the calling process (the "anchor") created and started with the stock /dev/gunyah
+  * ioctls, plus that VM's vcpu fds, and runs the vcpus in kernel threads. MMIO exits are serviced in the kernel
+- * (a 16550 at a given guest PA; every other read returns 0, every other write is dropped and counted).
++ * (a 16550 at a given guest PA). With GHK_LAUNCH_MMIO_FWD (ABI 3) every other MMIO exit is forwarded to the
++ * anchor through GHK_IOC_MMIO_XFER and the vcpu thread sleeps until the answer arrives (bounded by
++ * mmio_timeout_ms; on expiry the vcpu stops, fail-stop). Without it, every other read returns 0 and every other
++ * write is dropped and counted.
+  *
+  * SAFETY: by default (allow_launch=0, a load-time-only parameter) GHK_IOC_LAUNCH only validates the fds it is
+  * given and logs what it would do; no thread is created and no vcpu is run. Nothing in this module creates a
+@@ -16,6 +19,11 @@
+  *                               vcpu threads out of GUNYAH_VCPU_RUN (immediate_exit + SIGKILL) and they park
+  * The 16550 THRE interrupt is an eventfd the anchor registered as GUNYAH_FN_IRQFD for the UART's SPI (edge).
+  *
++ * Stage 4 (ABI 3) adds:
++ *   mmio_timeout_ms (default 2000, capped at 10000) upper bound for ghk_launch.mmio_timeout_ms
++ *   MMIO_FWD is accepted for exactly one vcpu (one request in flight per VM; the exit channel is per open file)
++ *   GHK_IOC_MMIO_XFER only from the launching process (current->mm == the VM's mm)
++ *
+  * Built against the exact running tree (O=~/piano-kbuild/out/kernel-usb1): it reads struct gunyah_vm (private,
+  * drivers/virt/gunyah/vm_mgr.h) for mm_s, and the public struct gunyah_vcpu. CONFIG_MODVERSIONS is off, so a
+  * layout mismatch is NOT caught at load time -- never load this against another build.
+@@ -46,6 +54,8 @@
+ 
+ static_assert(sizeof(struct ghk_launch) == 120, "ghk_launch ABI");
+ static_assert(sizeof(struct ghk_status) == 80, "ghk_status ABI");
++static_assert(sizeof(struct ghk_mmio_req) == 32, "ghk_mmio_req ABI");
++static_assert(sizeof(struct ghk_mmio_xfer) == 88, "ghk_mmio_xfer ABI");
+ 
+ /*
+  * Layout guard: the offsets ghoff.ko measured on the running kernel (gunyah_share_mod rm_off=440,
+@@ -66,6 +76,11 @@
+ module_param(max_run_ms, uint, 0444);
+ MODULE_PARM_DESC(max_run_ms, "Upper bound for ghk_launch.max_run_ms (a live launch must set 1..this)");
+ 
++static unsigned int mmio_timeout_ms = 2000;
++module_param(mmio_timeout_ms, uint, 0444);
++MODULE_PARM_DESC(mmio_timeout_ms, "Upper bound for ghk_launch.mmio_timeout_ms (MMIO_FWD: anchor answer deadline, max 10000)");
++#define GHK_MMIO_TIMEOUT_CAP_MS	10000
++
+ static bool verbose = true;
+ module_param(verbose, bool, 0644);
+ MODULE_PARM_DESC(verbose, "Log every launch decision");
+@@ -196,6 +211,21 @@
+ 
+ struct ghk_vm;
+ 
++/* ---------------------------------------------------------------- userspace MMIO exit channel (ABI 3) */
++
++enum ghk_fwd_state {
++	GHK_FWD_IDLE,		/* no request */
++	GHK_FWD_PENDING,	/* posted by the vcpu thread, not yet picked up by the anchor */
++	GHK_FWD_SERVING,	/* handed to the anchor by GHK_IOC_MMIO_XFER, answer outstanding */
++	GHK_FWD_DONE,		/* answered; the vcpu thread consumes it and returns to IDLE */
++};
++
++struct ghk_fwd_slot {
++	enum ghk_fwd_state state;	/* fwd_lock */
++	struct ghk_mmio_req req;	/* fwd_lock */
++	wait_queue_head_t wq;		/* the vcpu thread waits here for DONE */
++};
++
+ struct ghk_vcpu {
+ 	struct ghk_vm *vm;
+ 	unsigned int index;
+@@ -222,6 +252,17 @@
+ 	u32 exit_type;
+ 	struct timer_list deadline;	/* max_run_ms bound of a live launch */
+ 	bool timed_out;
++	/* exit channel (ABI 3); everything below except the counters is protected by fwd_lock */
++	spinlock_t fwd_lock;
++	wait_queue_head_t fwd_wq;	/* the anchor's GHK_IOC_MMIO_XFER waits here for PENDING / close */
++	bool fwd_open;			/* live launch with MMIO_FWD, until ghk_stop() */
++	struct mm_struct *fwd_mm;	/* identity only (no reference): the launching process */
++	unsigned int fwd_nr;		/* slots in use (= nr_vcpus) */
++	unsigned int fwd_timeout_ms;
++	u64 fwd_seq;
++	struct ghk_fwd_slot slots[GHK_MAX_VCPUS];
++	atomic64_t exits_mmio_fwd;
++	atomic_t mmio_fwd_timeouts;
+ };
+ 
+ static bool ghk_file_is(struct file *f, const char *owner, const char *name, bool prefix)
+@@ -234,12 +275,63 @@
+ 	return prefix ? !strncmp(dn, name, strlen(name)) : !strcmp(dn, name);
+ }
+ 
+-/* MMIO exit: fill run->mmio.data for reads, set resume_action. Returns true if a device model took it. */
+-static bool ghk_mmio(struct ghk_vm *vm, struct gunyah_vcpu_run *run)
++/*
++ * Forward one MMIO access to the anchor and sleep until it answers. Returns 0 (run->mmio.data holds the answer
++ * for a read), -ENOTCONN (channel closed: treat as unhandled), -ETIMEDOUT (no answer in fwd_timeout_ms) or
++ * -EINTR (SIGKILL from STOP/deadline). In every case the slot is IDLE again on return, so a late answer from
++ * the anchor gets -ESTALE and can never land in a later request.
++ */
++static int ghk_mmio_forward(struct ghk_vm *vm, struct ghk_vcpu *kv, struct gunyah_vcpu_run *run, u32 len)
+ {
++	struct ghk_fwd_slot *s = &vm->slots[kv->index];
++	bool is_write = run->mmio.is_write;
++	long t;
++	int ret;
++
++	spin_lock(&vm->fwd_lock);
++	if (!vm->fwd_open) {
++		spin_unlock(&vm->fwd_lock);
++		return -ENOTCONN;
++	}
++	memset(&s->req, 0, sizeof(s->req));
++	s->req.seq = ++vm->fwd_seq;
++	s->req.phys_addr = run->mmio.phys_addr;
++	s->req.len = len;
++	s->req.is_write = is_write;
++	s->req.vcpu = kv->index;
++	if (is_write)
++		memcpy(s->req.data, run->mmio.data, len);
++	s->state = GHK_FWD_PENDING;
++	spin_unlock(&vm->fwd_lock);
++	wake_up_interruptible(&vm->fwd_wq);
++
++	t = wait_event_interruptible_timeout(s->wq, READ_ONCE(s->state) == GHK_FWD_DONE,
++					     msecs_to_jiffies(vm->fwd_timeout_ms));
++
++	spin_lock(&vm->fwd_lock);
++	if (s->state == GHK_FWD_DONE) {
++		if (!is_write) {
++			memset(run->mmio.data, 0, sizeof(run->mmio.data));
++			memcpy(run->mmio.data, s->req.data, len);
++		}
++		ret = 0;
++	} else {
++		ret = t < 0 ? -EINTR : -ETIMEDOUT;
++	}
++	s->state = GHK_FWD_IDLE;
++	spin_unlock(&vm->fwd_lock);
++	return ret;
++}
++
++/*
++ * MMIO exit: fill run->mmio.data for reads, set resume_action. Returns 0 when the access was handled (in the
++ * kernel, by the anchor, or as an unhandled read-0/dropped write) and a negative error when the vcpu must stop.
++ */
++static int ghk_mmio(struct ghk_vm *vm, struct ghk_vcpu *kv, struct gunyah_vcpu_run *run)
++{
+ 	u64 pa = run->mmio.phys_addr;
+ 	u32 len = min_t(u32, run->mmio.len, sizeof(run->mmio.data));
+-	bool handled = false;
++	int ret;
+ 
+ 	atomic64_inc(&vm->exits_mmio);
+ 	run->mmio.resume_action = GUNYAH_VCPU_RESUME_HANDLED;
+@@ -253,17 +345,31 @@
+ 			memset(run->mmio.data, 0, sizeof(run->mmio.data));
+ 			run->mmio.data[0] = ghk_uart_read(&vm->uart, off);
+ 		}
+-		handled = true;
+-	} else if (!run->mmio.is_write) {
+-		memset(run->mmio.data, 0, sizeof(run->mmio.data));
++		return 0;
+ 	}
+ 
+-	if (!handled) {
+-		atomic64_inc(&vm->exits_mmio_unhandled);
+-		pr_info_ratelimited("unhandled MMIO %s %#llx len %u\n",
+-				    run->mmio.is_write ? "write" : "read", pa, len);
++	if (vm->fwd_nr && len >= 1) {
++		ret = ghk_mmio_forward(vm, kv, run, len);
++		if (!ret) {
++			atomic64_inc(&vm->exits_mmio_fwd);
++			return 0;
++		}
++		if (ret == -ETIMEDOUT) {
++			atomic_inc(&vm->mmio_fwd_timeouts);
++			pr_err("vcpu%u: anchor did not answer MMIO %s %#llx len %u within %u ms: stopping the vcpu\n",
++			       kv->index, run->mmio.is_write ? "write" : "read", pa, len, vm->fwd_timeout_ms);
++			return ret;
++		}
++		if (ret == -EINTR)
++			return ret;
++		/* -ENOTCONN: the channel is being closed; fall through to read-0 / drop */
+ 	}
+-	return handled;
++
++	if (!run->mmio.is_write)
++		memset(run->mmio.data, 0, sizeof(run->mmio.data));
++	atomic64_inc(&vm->exits_mmio_unhandled);
++	pr_info_ratelimited("unhandled MMIO %s %#llx len %u\n", run->mmio.is_write ? "write" : "read", pa, len);
++	return 0;
+ }
+ 
+ static int ghk_vcpu_thread(void *data)
+@@ -294,7 +400,13 @@
+ 		}
+ 		switch (run->exit_reason) {
+ 		case GUNYAH_VCPU_EXIT_MMIO:
+-			ghk_mmio(vm, run);
++			r = ghk_mmio(vm, kv, run);
++			if (r == -EINTR)
++				goto out;	/* STOP / deadline: the next RUN would return -EINTR anyway */
++			if (r) {
++				vm->last_error = r;
++				goto out;
++			}
+ 			break;
+ 		case GUNYAH_VCPU_EXIT_STATUS:
+ 			vm->vm_status = run->status.status;
+@@ -368,6 +480,19 @@
+ 	if (vm->uart.irq)
+ 		eventfd_ctx_put(vm->uart.irq);
+ 	vm->uart.irq = NULL;
++}
++
++static void ghk_fwd_close(struct ghk_vm *vm)
++{
++	unsigned int i;
++
++	spin_lock(&vm->fwd_lock);
++	WRITE_ONCE(vm->fwd_open, false);
++	vm->fwd_mm = NULL;
++	spin_unlock(&vm->fwd_lock);
++	wake_up_interruptible_all(&vm->fwd_wq);
++	for (i = 0; i < GHK_MAX_VCPUS; i++)
++		wake_up_interruptible_all(&vm->slots[i].wq);
+ }
+ 
+ static void ghk_stop(struct ghk_vm *vm)
+@@ -377,6 +502,7 @@
+ 	if (!vm->launched)
+ 		return;
+ 	timer_delete_sync(&vm->deadline);	/* before any task_struct reference goes away */
++	ghk_fwd_close(vm);			/* wakes a waiting anchor (-ENOTCONN) and any waiting vcpu */
+ 	for (i = 0; i < vm->nr_vcpus; i++) {
+ 		struct ghk_vcpu *kv = &vm->vcpus[i];
+ 
+@@ -389,6 +515,7 @@
+ 		kv->task = NULL;
+ 		WRITE_ONCE(kv->vcpu->vcpu_run->immediate_exit, 0);
+ 	}
++	vm->fwd_nr = 0;				/* no vcpu thread left that could look at it */
+ 	ghk_uart_flush(&vm->uart);
+ 	ghk_release_files(vm);
+ 	vm->launched = false;
+@@ -409,13 +536,27 @@
+ 		pr_warn("refusing %u vcpus (max_vcpus=%u): not the test guest\n", req.nr_vcpus, max_vcpus);
+ 		return -EPERM;
+ 	}
+-	if (req.pad0)
++	if (req.pad0 || req.pad1)
+ 		return -EINVAL;
+ 	for (i = 0; i < ARRAY_SIZE(req.reserved); i++)
+ 		if (req.reserved[i])
+ 			return -EINVAL;
+-	if (req.flags & ~(GHK_LAUNCH_DRY_RUN | GHK_LAUNCH_SERIAL | GHK_LAUNCH_SERIAL_IRQ))
++	if (req.flags & ~(GHK_LAUNCH_DRY_RUN | GHK_LAUNCH_SERIAL | GHK_LAUNCH_SERIAL_IRQ | GHK_LAUNCH_MMIO_FWD))
+ 		return -EINVAL;
++	if (req.flags & GHK_LAUNCH_MMIO_FWD) {
++		if (req.nr_vcpus != 1) {
++			pr_warn("refusing MMIO_FWD with %u vcpus: ABI 3 forwards for exactly one vcpu\n", req.nr_vcpus);
++			return -EPERM;
++		}
++		if (!req.mmio_timeout_ms || req.mmio_timeout_ms > mmio_timeout_ms ||
++		    (req.max_run_ms && req.mmio_timeout_ms >= req.max_run_ms)) {
++			pr_warn("refusing MMIO_FWD: mmio_timeout_ms %u not in 1..%u (and < max_run_ms %u)\n",
++				req.mmio_timeout_ms, mmio_timeout_ms, req.max_run_ms);
++			return -EINVAL;
++		}
++	} else if (req.mmio_timeout_ms) {
++		return -EINVAL;
++	}
+ 	if ((req.flags & GHK_LAUNCH_SERIAL_IRQ) && !(req.flags & GHK_LAUNCH_SERIAL))
+ 		return -EINVAL;
+ 	if (allow_launch && !(req.flags & GHK_LAUNCH_DRY_RUN) &&
+@@ -481,9 +622,10 @@
+ 	}
+ 
+ 	if (verbose) {
+-		pr_info("launch request from pid %d: vmid %u, %u vcpu(s), serial %s at %#llx, irq %s, max %u ms%s\n",
++		pr_info("launch request from pid %d: vmid %u, %u vcpu(s), serial %s at %#llx, irq %s, max %u ms, mmio fwd %s (%u ms)%s\n",
+ 			current->pid, vm->ghvm->vmid, req.nr_vcpus, vm->serial ? "on" : "off",
+ 			req.serial_base, vm->uart.irq ? "eventfd" : "none", req.max_run_ms,
++			(req.flags & GHK_LAUNCH_MMIO_FWD) ? "on" : "off", req.mmio_timeout_ms,
+ 			(req.flags & GHK_LAUNCH_DRY_RUN) ? " (dry run)" : "");
+ 		for (i = 0; i < req.nr_vcpus; i++)
+ 			pr_info("  would run vcpu%u (label %u, state %d) in a kthread with the caller's mm, %s %d\n",
+@@ -506,6 +648,20 @@
+ 	vm->vm_status = 0;
+ 	vm->exit_type = 0;
+ 	vm->timed_out = false;
++	atomic64_set(&vm->exits_mmio_fwd, 0);
++	atomic_set(&vm->mmio_fwd_timeouts, 0);
++	spin_lock(&vm->fwd_lock);
++	for (i = 0; i < GHK_MAX_VCPUS; i++)
++		vm->slots[i].state = GHK_FWD_IDLE;
++	if (req.flags & GHK_LAUNCH_MMIO_FWD) {
++		vm->fwd_nr = vm->nr_vcpus;
++		vm->fwd_timeout_ms = req.mmio_timeout_ms;
++		vm->fwd_mm = current->mm;
++		WRITE_ONCE(vm->fwd_open, true);
++	} else {
++		vm->fwd_nr = 0;
++	}
++	spin_unlock(&vm->fwd_lock);
+ 	vm->launched = true;
+ 	for (i = 0; i < vm->nr_vcpus; i++) {
+ 		struct ghk_vcpu *kv = &vm->vcpus[i];
+@@ -532,6 +688,82 @@
+ err:
+ 	ghk_release_files(vm);
+ 	return ret;
++}
++
++static bool ghk_fwd_ready(struct ghk_vm *vm)
++{
++	unsigned int i;
++
++	if (!READ_ONCE(vm->fwd_open))
++		return true;
++	for (i = 0; i < GHK_MAX_VCPUS; i++)
++		if (READ_ONCE(vm->slots[i].state) == GHK_FWD_PENDING)
++			return true;
++	return false;
++}
++
++/*
++ * GHK_IOC_MMIO_XFER: complete the anchor's previous request (optional) and wait up to wait_ms for the next.
++ * Runs without vm->lock (it sleeps); everything it touches is under fwd_lock and lives as long as the file.
++ */
++static long ghk_mmio_xfer(struct ghk_vm *vm, struct ghk_mmio_xfer __user *uarg)
++{
++	struct ghk_mmio_xfer x;
++	struct ghk_fwd_slot *s;
++	struct ghk_mmio_req next = {};
++	unsigned int i;
++	long ret = 0;
++
++	if (copy_from_user(&x, uarg, sizeof(x)))
++		return -EFAULT;
++	if ((x.flags & ~GHK_MMIO_COMPLETE) || x.wait_ms > GHK_MMIO_MAX_WAIT_MS || x.reserved[0] || x.reserved[1])
++		return -EINVAL;
++
++	spin_lock(&vm->fwd_lock);
++	if (!vm->fwd_open) {
++		ret = -ENOTCONN;
++	} else if (vm->fwd_mm != current->mm) {
++		ret = -EPERM;
++	} else if (x.flags & GHK_MMIO_COMPLETE) {
++		if (x.done.vcpu >= vm->fwd_nr) {
++			ret = -ESTALE;
++		} else {
++			s = &vm->slots[x.done.vcpu];
++			if (s->state != GHK_FWD_SERVING || s->req.seq != x.done.seq) {
++				ret = -ESTALE;
++			} else {
++				if (!s->req.is_write)
++					memcpy(s->req.data, x.done.data, sizeof(s->req.data));
++				WRITE_ONCE(s->state, GHK_FWD_DONE);
++				wake_up_interruptible(&s->wq);
++			}
++		}
++	}
++	spin_unlock(&vm->fwd_lock);
++	if (ret)
++		return ret;
++
++	/* A signal just ends the wait early (0 + seq 0): the completion above has already been consumed. */
++	wait_event_interruptible_timeout(vm->fwd_wq, ghk_fwd_ready(vm), msecs_to_jiffies(x.wait_ms));
++
++	spin_lock(&vm->fwd_lock);
++	if (!vm->fwd_open) {
++		ret = -ENOTCONN;
++	} else {
++		for (i = 0; i < vm->fwd_nr; i++) {
++			s = &vm->slots[i];
++			if (s->state == GHK_FWD_PENDING) {
++				s->state = GHK_FWD_SERVING;
++				next = s->req;
++				break;
++			}
++		}
++	}
++	spin_unlock(&vm->fwd_lock);
++	if (ret)
++		return ret;
++	/* a failed copy leaves the request SERVING: the vcpu then times out (fail-stop), nothing else breaks */
++	return copy_to_user(&uarg->next, &next, sizeof(next)) ? -EFAULT : 0;
+ }
+ 
+ static long ghk_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+@@ -556,7 +788,10 @@
+ 	case GHK_IOC_STATUS:
+ 		st.running = atomic_read(&vm->running);
+ 		st.launched = vm->launched;
+-		st.flags = READ_ONCE(vm->timed_out) ? GHK_STATUS_TIMED_OUT : 0;
++		st.flags = (READ_ONCE(vm->timed_out) ? GHK_STATUS_TIMED_OUT : 0) |
++			   (READ_ONCE(vm->fwd_open) ? GHK_STATUS_MMIO_FWD : 0);
++		st.exits_mmio_fwd = atomic64_read(&vm->exits_mmio_fwd);
++		st.mmio_fwd_timeouts = atomic_read(&vm->mmio_fwd_timeouts);
+ 		st.exit_type = vm->exit_type;
+ 		st.exits_mmio = atomic64_read(&vm->exits_mmio);
+ 		st.exits_mmio_unhandled = atomic64_read(&vm->exits_mmio_unhandled);
+@@ -565,6 +800,8 @@
+ 		st.last_error = vm->last_error;
+ 		st.vm_status = vm->vm_status;
+ 		return copy_to_user((void __user *)arg, &st, sizeof(st)) ? -EFAULT : 0;
++	case GHK_IOC_MMIO_XFER:
++		return ghk_mmio_xfer(vm, (struct ghk_mmio_xfer __user *)arg);
+ 	}
+ 	return -ENOTTY;
+ }
+@@ -572,12 +809,17 @@
+ static int ghk_open(struct inode *inode, struct file *filp)
+ {
+ 	struct ghk_vm *vm = kzalloc(sizeof(*vm), GFP_KERNEL);
++	unsigned int i;
+ 
+ 	if (!vm)
+ 		return -ENOMEM;
+ 	mutex_init(&vm->lock);
+ 	spin_lock_init(&vm->uart.lock);
+ 	timer_setup(&vm->deadline, ghk_deadline, 0);
++	spin_lock_init(&vm->fwd_lock);
++	init_waitqueue_head(&vm->fwd_wq);
++	for (i = 0; i < GHK_MAX_VCPUS; i++)
++		init_waitqueue_head(&vm->slots[i].wq);
+ 	filp->private_data = vm;
+ 	return 0;
+ }
+@@ -610,12 +852,16 @@
+ 
+ static int __init ghk_init(void)
+ {
+-	int ret = misc_register(&ghk_misc);
++	int ret;
+ 
++	if (mmio_timeout_ms > GHK_MMIO_TIMEOUT_CAP_MS)
++		mmio_timeout_ms = GHK_MMIO_TIMEOUT_CAP_MS;
++	ret = misc_register(&ghk_misc);
+ 	if (ret)
+ 		return ret;
+-	pr_info("loaded: /dev/ghk, ABI %d, allow_launch=%d%s, max_vcpus=%u, max_run_ms=%u\n", GHK_ABI_VERSION,
+-		allow_launch, allow_launch ? "" : " (validate-and-log only)", max_vcpus, max_run_ms);
++	pr_info("loaded: /dev/ghk, ABI %d, allow_launch=%d%s, max_vcpus=%u, max_run_ms=%u, mmio_timeout_ms=%u\n",
++		GHK_ABI_VERSION, allow_launch, allow_launch ? "" : " (validate-and-log only)", max_vcpus, max_run_ms,
++		mmio_timeout_ms);
+ 	return 0;
+ }
+ 
+@@ -627,6 +873,6 @@
+ 
+ module_init(ghk_init);
+ module_exit(ghk_exit);
+-MODULE_DESCRIPTION("Gunyah kernel launcher (kernel-first VMM, stage-3 anchor ABI 2)");
++MODULE_DESCRIPTION("Gunyah kernel launcher (kernel-first VMM, stage-4 ABI 3: userspace MMIO exit channel)");
+ MODULE_LICENSE("GPL");
+ MODULE_SOFTDEP("pre: gunyah_rsc_mgr gunyah_vcpu");
+--- ghk-abi2/ghk-ctl.py
++++ ghk-abi3/ghk-ctl.py
+@@ -1,40 +1,56 @@
+ #!/usr/bin/env python3
+-"""Poke /dev/ghk (ABI 2) without a VM: ABI version, status, and a launch request that must be refused.
++"""Poke /dev/ghk (ABI 3) without a VM: ABI version, status, a launch request that must be refused, and an
++MMIO_XFER that must fail with ENOTCONN (no exit channel is open without a live MMIO_FWD launch).
+ 
+-  sudo python3 ghk-ctl.py version | status | refuse
++  sudo python3 ghk-ctl.py version | status | refuse | xfer
+ 'refuse' passes /dev/null as the VM fd: the module must log "fd N is not a gunyah VM" and return EINVAL. No VM is
+ created or touched by any of these.
+ """
+ import errno, fcntl, os, struct, sys
+-assert struct.calcsize("<IiI8i8iIQiI3Q") == 120 and struct.calcsize("<IIQQQQiIII3Q") == 80
+ 
+ T = 0xB7
+ def _IOC(d, nr, size): return (d << 30) | (size << 16) | (T << 8) | nr
+-LAUNCH_FMT = "<IiI" + "8i" + "8i" + "I" + "Q" + "iI" + "3Q"  # struct ghk_launch (120 bytes)
+-STATUS_FMT = "<IIQQQQiIII3Q"                        # struct ghk_status (80 bytes)
++LAUNCH_FMT = "<IiI" + "8i" + "8i" + "I" + "Q" + "iI" + "II" + "2Q"  # struct ghk_launch (120 bytes)
++STATUS_FMT = "<IIQQQQiIIIQIIQ"                                       # struct ghk_status (80 bytes)
++REQ_FMT = "QQ8sIBBH"                                                 # struct ghk_mmio_req (32 bytes)
++XFER_FMT = "<II" + REQ_FMT + REQ_FMT + "2Q"                          # struct ghk_mmio_xfer (88 bytes)
++assert struct.calcsize(LAUNCH_FMT) == 120 and struct.calcsize(STATUS_FMT) == 80
++assert struct.calcsize("<" + REQ_FMT) == 32 and struct.calcsize(XFER_FMT) == 88
+ VERSION = _IOC(0, 0, 0)
+-LAUNCH = _IOC(1, 1, struct.calcsize(LAUNCH_FMT))
+-STATUS = _IOC(2, 3, struct.calcsize(STATUS_FMT))
++LAUNCH = _IOC(1, 1, 120)
++STATUS = _IOC(2, 3, 80)
++XFER = _IOC(3, 4, 88)
+ 
+ def main(cmd):
+     fd = os.open("/dev/ghk", os.O_RDWR)
+     if cmd == "version":
+         print("ABI", fcntl.ioctl(fd, VERSION))
+     elif cmd == "status":
+-        buf = bytearray(struct.calcsize(STATUS_FMT))
++        buf = bytearray(80)
+         fcntl.ioctl(fd, STATUS, buf)
+         f = struct.unpack(STATUS_FMT, buf)
+         print(dict(running=f[0], launched=f[1], exits_mmio=f[2], exits_mmio_unhandled=f[3], exits_other=f[4],
+-                   serial_bytes=f[5], last_error=f[6], vm_status=f[7], timed_out=bool(f[8] & 1), exit_type=f[9]))
++                   serial_bytes=f[5], last_error=f[6], vm_status=f[7], timed_out=bool(f[8] & 1),
++                   mmio_fwd_open=bool(f[8] & 2), exit_type=f[9], exits_mmio_fwd=f[10], mmio_fwd_timeouts=f[11]))
+     elif cmd == "refuse":
+         null = os.open("/dev/null", os.O_RDWR)
+-        req = struct.pack(LAUNCH_FMT, 1, null, 1, *([null] + [-1] * 7), *([-1] * 8), 0, 0x3f8, -1, 1000, 0, 0, 0)
++        req = struct.pack(LAUNCH_FMT, 1, null, 1, *([null] + [-1] * 7), *([-1] * 8), 0, 0x3f8, -1, 1000, 0, 0, 0, 0)
+         try:
+             fcntl.ioctl(fd, LAUNCH, req)
+             print("UNEXPECTED: launch accepted")
+             return 1
+         except OSError as e:
+             print("refused as expected:", errno.errorcode.get(e.errno, e.errno))
++    elif cmd == "xfer":
++        buf = bytearray(struct.pack(XFER_FMT, 0, 10, 0, 0, b"\0" * 8, 0, 0, 0, 0, 0, 0, b"\0" * 8, 0, 0, 0, 0, 0, 0))
++        try:
++            fcntl.ioctl(fd, XFER, buf)
++            print("UNEXPECTED: MMIO_XFER succeeded without a launch")
++            return 1
++        except OSError as e:
++            ok = e.errno == errno.ENOTCONN
++            print("MMIO_XFER", "refused as expected:" if ok else "UNEXPECTED error:", errno.errorcode.get(e.errno, e.errno))
++            return 0 if ok else 1
+     else:
+         print(__doc__)
+         return 2

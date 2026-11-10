@@ -1,0 +1,31 @@
+# UniXNU
+remote: https://github.com/Droid-VM/UniXNU.git
+HEAD: baeb8f0cf2143bd84e6076252c7f90345cc6fef6
+branch: 
+
+## status
+ M drivers/DarwinBoot
+ M kits/NativePrelink
+
+## submodule status
+ 1951cc8444b340d7d8879e9418220cf29eb711d7 drivers/ArmCpu (1951cc8)
+ 0d544705c2e89725caabc0542bb96bc8febd8c70 drivers/ArmDTPlatform (0d54470)
+ 532de8c017e394e69a0b48dc0ffc4ac0d0701177 drivers/ArmVirtPlatform (532de8c)
+ 85332b317ee80898fc78939ea64e6ca52d3837a3 drivers/DarwinBoot (85332b3)
+ a34964b8c2fec2e83c8e4f68fb7d6fb7e4b2227b drivers/NativeAES (a34964b)
+ 805c7e4bfb7451eb6923f4a14dea8c657b9be7d2 drivers/NativeAdreno (805c7e4)
+ b5399b5646c4d7415deec6d887fd51715a97a024 drivers/NativeGeniSpi (b5399b5)
+ d16d21922fd422740e25ee5c481ffc51de9cfd41 drivers/NativeHidInput (d16d219)
+ e59bac4ad1ac8825919ae94da8440a64d8ab90b3 drivers/NativeKeyStoreEvents (e59bac4)
+ 6dcd4cbb69eb5625988706de42aa8ad3009b8ee7 drivers/NativeMetal (6dcd4cb)
+ eb9c949164826c2e52f2771eac19e4b8bd8a3dae drivers/NativeMobileDisplay (eb9c949)
+ 7194961a668e59018323b626be4fd7ce0a91e78f drivers/NativeRamBlock (7194961)
+ af785c1777161a62931425c2faaa536ce0bebd5b drivers/NativeUfs (af785c1)
+ 98909eb9198a4360d7a43be831887cb8b74d814d drivers/NativeVirtioBlock (98909eb)
+ 066f9bded311233ed56824e13a5628077619efda drivers/NativeVirtioConsole (066f9bd)
+ 40fdb8ea87606612ac6f1e80bbb49955d0ce4051 kits/AdrenoFirmware (40fdb8e)
+ 445f8fe6d115738352b9d78dc70af6d61aa7f62f kits/AdrenoPM4 (445f8fe)
+ 032a867b5dc3121164bbd706e4e81e3b9fcd2b8f kits/AirNir (032a867)
+ 4d0d6598b1a36aeec3de01091893fa6660e49388 kits/ArmSmmu4K (4d0d659)
+ 3380d3006068cdaab69454b37668e6b532ed2584 kits/NativePrelink (3380d30)
+ 2854c61f6c4dfda870ac3d93e1f03d9181edb041 kits/VerifiedRoot (2854c61)

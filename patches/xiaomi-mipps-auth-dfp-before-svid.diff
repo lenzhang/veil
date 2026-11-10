@@ -1,0 +1,131 @@
+--- /tmp/mipps-auth.py	2026-11-10 11:04:28
++++ /tmp/sc2/xiaomi-mipps-auth	2026-11-10 11:09:18
+@@ -428,6 +428,16 @@
+ 
+ 
+ def ensure_typec_host(timeout, root=None):
++    # piano (streamC2): ucsi_glink now registers /sys/class/typec/port0, but
++    # the stock path is the MCA relay node (request_vdm_cmd 200 ->
++    # MCA_PROP_DATA_ROLE), which the ADSP honours while verify_process=1.
++    # Prefer it over a UCSI SET_UOR through the Type-C class.
++    if root and os.path.exists(os.path.join(root, "data_role")):
++        try:
++            return ensure_charger_dfp(root, timeout)
++        except OSError as e:
++            print(f"warning: failed to request the dfp data role: {e}", file=sys.stderr)
++            return False
+     port = find_typec_port()
+     if not port and root and os.path.exists(os.path.join(root, "data_role")):
+         try:
+@@ -534,6 +544,44 @@
+         return None
+ 
+ 
++def wait_adapter_svid(root, timeout):
++    # piano (streamC2): the ADSP learns the SVID (Discover Identity/SVIDs)
++    # only after the DFP swap, so it reads 0000 until then
++    deadline = time.monotonic() + timeout
++    svid = current_adapter_svid(root)
++    while svid != XIAOMI_SVID and time.monotonic() < deadline:
++        time.sleep(0.1)
++        svid = current_adapter_svid(root)
++    return svid
++
++
++def wait_pd_type(root, timeout):
++    # piano reports the BC1.2/Type-C type before the PD contract
++    deadline = time.monotonic() + timeout
++    while True:
++        try:
++            rt = read_node(root, "real_type")
++        except OSError:
++            return False
++        if rt in ("PD", "PD_PPS"):
++            return True
++        if time.monotonic() >= deadline:
++            print(f"real_type={rt}")
++            return False
++        time.sleep(0.1)
++
++
++def restore_ufp(root, role_before):
++    if role_before != "ufp" or not os.path.exists(os.path.join(root, "data_role")):
++        return
++    try:
++        if read_node(root, "data_role") == "dfp":
++            write_node(root, "data_role", "ufp")
++            print("data_role restored to ufp")
++    except OSError as e:
++        print(f"warning: failed to restore the ufp data role: {e}", file=sys.stderr)
++
++
+ def detect_adapter_id(root, timeout):
+     deadline = time.monotonic() + timeout
+     while time.monotonic() < deadline:
+@@ -681,6 +729,10 @@
+     parser.add_argument("--usb-online-trigger", action="store_true",
+                         help=argparse.SUPPRESS)
+     parser.add_argument("--timeout", type=float, default=2.0)
++    parser.add_argument("--svid-timeout", type=float, default=3.0,
++                        help="seconds to wait for the Xiaomi SVID after the DFP swap")
++    parser.add_argument("--probe-uvdm", action="store_true",
++                        help="continue with the UVDM exchange even if the SVID stays unknown after the swap")
+     args = parser.parse_args()
+ 
+     if args.clear_notification:
+@@ -718,11 +770,15 @@
+             print("warning: no Type-C partner found for once-per-attach state",
+                   file=sys.stderr)
+ 
+-    if current_adapter_svid(root) != XIAOMI_SVID:
+-        # A partner event can precede SVID discovery. Keep the online trigger
+-        # armed so the kernel's later Xiaomi identity event can start auth.
++    # piano (streamC2): the SVID is 0000 until the DFP swap (the ADSP reads
++    # the adapter identity only as DFP), so it cannot gate the swap.  Gate
++    # on what is known as UFP instead: a PD source offering a second PDO,
++    # and check the SVID after the swap (below).
++    if (current_adapter_svid(root) != XIAOMI_SVID and
++            (not wait_pd_type(root, 2 * args.timeout) or
++             should_skip_pdo2(root, args.timeout))):
+         write_state_file(USB_ONLINE_STATE_FILE, "0")
+-        print("MiPPS auth skipped: current charger is not Xiaomi")
++        print("MiPPS auth skipped: not a PD source with a second PDO")
+         return
+ 
+     state, _ = vdm_state(root)
+@@ -749,20 +805,29 @@
+         print(f"seed_index={seed_index}")
+ 
+         # piano: the charger firmware only swaps roles during an authentication
++        try:
++            role_before = read_node(root, "data_role")
++        except OSError:
++            role_before = None
++        print(f"data_role_before={role_before}")
+         set_verify_process(root, "1")
+         if not args.no_data_role_swap:
+             ensure_typec_host(args.timeout, root)
+ 
+-        adapter_svid = current_adapter_svid(root)
++        adapter_svid = wait_adapter_svid(root, args.svid_timeout)
+         if adapter_svid is None:
+             print("adapter_svid=unknown")
+         else:
+             print(f"adapter_svid=0x{adapter_svid:04x}")
+-            if adapter_svid != XIAOMI_SVID:
+-                print(
+-                    "warning: adapter_svid is not Xiaomi; continuing because "
+-                    "firmware may expose a stale SVID after detach",
+-                    file=sys.stderr)
++        if adapter_svid != XIAOMI_SVID:
++            if not args.probe_uvdm:
++                restore_ufp(root, role_before)
++                write_state_file(USB_ONLINE_STATE_FILE, "0")
++                raise UnsupportedChargerError(
++                    "current charger is not Xiaomi (no SVID 2717 after the dfp swap)",
++                    terminal=True)
++            print("warning: adapter_svid is not Xiaomi; --probe-uvdm given, continuing",
++                  file=sys.stderr)
+ 
+         if should_skip_pdo2(root, args.timeout):
+             raise UnsupportedChargerError("pdo2 reports no source PDO for adapter authentication",
